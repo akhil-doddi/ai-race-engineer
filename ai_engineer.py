@@ -2,62 +2,77 @@
 
 ### File: ai_engineer.py
 
-import os
 import openai
 import speech_recognition as sr
-import pyttsx3 
-from dotenv import load_dotenv
+import pyttsx3
 
-# Load environment variables
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# 1. Set your API key
+openai.api_key = "sk-..."  # Keep this secret in actual use
 
-# Initialize TTS engine
+# 2. Initialize voice engine
 engine = pyttsx3.init()
 engine.setProperty('rate', 175)
+engine.setProperty('voice', 'com.apple.speech.synthesis.voice.daniel')
 
-# Function to get voice input
-def listen_to_voice():
-    recognizer = sr.Recognizer()
+# 3. Initialize recognizer
+r = sr.Recognizer()
+
+# 4. Simulated race data
+race_data = {
+    'last_lap_time': '1:32.4',
+    'car_ahead_gap': 2.3,
+    'tire_wear': 61,
+    'position': 4,
+    'strategy': 'Hold position and box in 5 laps'
+}
+
+# 5. Prompt generator
+def generate_race_prompt(user_input, race_data):
+    if "lap" in user_input.lower():
+        return f"Driver asked about lap times. Last lap was {race_data['last_lap_time']}. Car ahead is {race_data['car_ahead_gap']}s ahead."
+
+    if "tire" in user_input.lower():
+        return f"Driver asked about tire wear. Current tire wear is {race_data['tire_wear']}%. Strategy is: {race_data['strategy']}."
+
+    if "position" in user_input.lower():
+        return f"Driver asked about position. Currently P{race_data['position']}, {race_data['car_ahead_gap']}s behind the car ahead."
+
+    if "strategy" in user_input.lower():
+        return f"Driver asked for race strategy. Strategy: {race_data['strategy']}."
+
+    return f"Driver query: {user_input}. Use current data: {race_data} to respond calmly and briefly."
+
+
+# 6. Main loop
+while True:
     with sr.Microphone() as source:
-        print("Ready. Say something...")
-        audio = recognizer.listen(source)
-    try:
-        command = recognizer.recognize_google(audio)
-        print(f"You said: {command}")
-        return command
-    except sr.UnknownValueError:
-        print("Could not understand audio")
-        return ""
-    except sr.RequestError as e:
-        print(f"Speech recognition error: {e}")
-        return ""
+        print("\n��️ Speak...")
+        audio = r.listen(source)
 
-# Function to call GPT-3.5
-
-def get_ai_response(prompt):
     try:
-        response = openai.ChatCompletion.create(
+        user_input = r.recognize_google(audio)
+        print(f"You said: {user_input}")
+
+        # Build dynamic prompt
+        race_prompt = generate_race_prompt(user_input, race_data)
+
+        # Chat API call
+        client = openai.OpenAI()
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a Formula 1 race engineer. Respond with short, focused radio updates using race telemetry."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=200,
-            temperature=0.7
+                {"role": "system", "content": "You are an F1 race engineer. Be calm, British, and precise."},
+                {"role": "user", "content": race_prompt}
+            ]
         )
-        return response.choices[0].message.content.strip()
+
+        reply = response.choices[0].message.content
+        print(f"Engineer: {reply}")
+
+        engine.say(reply)
+        engine.runAndWait()
+
+    except sr.UnknownValueError:
+        print("Didn't catch that.")
     except Exception as e:
-        return f"[Error] {str(e)}"
-
-# Main interaction loop
-while True:
-    user_input = listen_to_voice()
-    if user_input.lower() in ["exit", "quit"]:
-        break
-
-    ai_reply = get_ai_response(user_input)
-    print(f"Engineer: {ai_reply}")
-    engine.say(ai_reply)
-    engine.runAndWait()
-
+        print(f"Error: {e}")
