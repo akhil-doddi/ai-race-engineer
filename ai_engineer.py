@@ -6,6 +6,10 @@ import openai
 import speech_recognition as sr
 import pyttsx3
 import json
+from telemetry import Telemetry
+
+telemetry = Telemetry()
+telemetry.start()
 
 # Load telemetry data
 with open('telemetry.json', 'r') as f:
@@ -54,6 +58,9 @@ while True:
             f"Tire wear at {telemetry['tire_wear']}, last lap was {telemetry['lap_time']}, "
             f"fuel left for {telemetry['fuel_left']}."
         )
+        # Get current data:
+        telemetry_snapshot = telemetry.get_data()
+            print(f"Telemetry: {telemetry_snapshot}")
 
         # OpenAI chat call with telemetry-enhanced system prompt
         client = openai.OpenAI()
@@ -78,4 +85,3 @@ while True:
         print("Didn't catch that.")
     except Exception as e:
         print(f"Error: {e}")
-        
