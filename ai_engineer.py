@@ -1,87 +1,110 @@
-## Project: AI Race Engineer (Voice Assistant for F1-style Telemetry Feedback)
-
-### File: ai_engineer.py
-
 import openai
 import speech_recognition as sr
 import pyttsx3
-import json
-from telemetry import Telemetry
-
-telemetry = Telemetry()
-telemetry.start()
-
-# Load telemetry data
-with open('telemetry.json', 'r') as f:
-    telemetry_feed = json.load(f)
-
-telemetry_index = 0
+import threading
+import time
+import random
 
 # 1. Set your API key
-openai.api_key = "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"  # Keep this secret in actual use
+openai.api_key = "sk-proj-..."  # Replace with your actual key
 
-# 2. Initialize voice engine
+# 2. Initialize text-to-speech engine
 engine = pyttsx3.init()
 engine.setProperty('rate', 175)
 engine.setProperty('voice', 'com.apple.speech.synthesis.voice.daniel')
 
-# 3. Initialize recognizer
+# 3. Initialize speech recognizer
 r = sr.Recognizer()
 
-# 4. Simulated telemetry feed
-telemetry_feed = [
-    {"lap": 15, "position": "P4", "gap_ahead": "2.3s", "gap_behind": "1.1s", "tire_wear": "61%", "lap_time": "1:32.4", "fuel_left": "5 laps"},
-    {"lap": 16, "position": "P4", "gap_ahead": "2.1s", "gap_behind": "1.4s", "tire_wear": "63%", "lap_time": "1:32.1", "fuel_left": "4 laps"},
-    {"lap": 17, "position": "P3", "gap_ahead": "1.8s", "gap_behind": "0.9s", "tire_wear": "65%", "lap_time": "1:31.9", "fuel_left": "3 laps"},
-    {"lap": 18, "position": "P3", "gap_ahead": "1.5s", "gap_behind": "1.2s", "tire_wear": "68%", "lap_time": "1:31.7", "fuel_left": "2 laps"},
-]
-telemetry_index = 0
+# 4. Telemetry simulator
+class Telemetry:
+    def __init__(self):
+        self.running = False
+        self.data = {
+            'speed': 0,
+            'gear': 1,
+            'lap': 1,
+            'tire_wear': 100.0,
+            'position': 10,
+            'fuel': 100.0
+        }
 
-# 5. Main loop
-while True:
-    with sr.Microphone() as source:
-        print("\n🎙️ Speak...")
-        audio = r.listen(source)
+    def update(self):
+        while self.running:
+            self.data['speed'] = random.randint(180, 320)
+            self.data['gear'] = random.randint(1, 8)
+            self.data['lap'] += 1
+            self.data['tire_wear'] -= random.uniform(0.5, 2.0)
+            self.data['position'] = random.randint(1, 20)
+            self.data['fuel'] -= random.uniform(1.0, 2.5)
+            time.sleep(5)
 
-    try:
-        user_input = r.recognize_google(audio)
-        print(f"You said: {user_input}")
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self.update)
+        self.thread.start()
 
-        # Rotate through telemetry
-        telemetry = telemetry_feed[telemetry_index % len(telemetry_feed)]
-        telemetry_index += 1
+    def stop(self):
+        self.running = False
+        self.thread.join()
 
-        # Build telemetry string
-        telemetry_prompt = (
-            f"Lap {telemetry['lap']}. You're in {telemetry['position']}, "
-            f"{telemetry['gap_ahead']} to car ahead, {telemetry['gap_behind']} behind. "
-            f"Tire wear at {telemetry['tire_wear']}, last lap was {telemetry['lap_time']}, "
-            f"fuel left for {telemetry['fuel_left']}."
-        )
-        # Get current data:
-        telemetry_snapshot = telemetry.get_data()
+    def get_data(self):
+        return self.data.copy()
+
+# 5. Prompt generator
+def generate_prompt(user_input, telemetry):
+    return (
+        f"You are an F1 race engineer. Use a calm, precise British tone.\n"
+        f"Telemetry data: Speed: {telemetry['speed']} km/h, Gear: {telemetry['gear']}, "
+        f"Lap: {telemetry['lap']}, Position: {telemetry['position']}, "
+        f"Tire wear: {telemetry['tire_wear']:.1f}%, Fuel: {telemetry['fuel']:.1f}%\n\n"
+        f"Driver says: \"{user_input}\"\n\n"
+        f"Respond as a race engineer."
+    )
+
+# 6. Start telemetry
+telemetry = Telemetry()
+telemetry.start()
+
+# 7. Main loop
+try:
+    while True:
+        with sr.Microphone() as source:
+            print("\n🎙️ Speak...")
+            audio = r.listen(source)
+
+        try:
+            user_input = r.recognize_google(audio)
+            print(f"You said: {user_input}")
+
+            # 7.1 Get telemetry snapshot
+            telemetry_snapshot = telemetry.get_data()
             print(f"Telemetry: {telemetry_snapshot}")
 
-        # OpenAI chat call with telemetry-enhanced system prompt
-        client = openai.OpenAI()
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"You are an F1 race engineer. Be calm, British, and precise. Use this telemetry: {telemetry_prompt}"
-                },
-                {"role": "user", "content": user_input}
-            ]
-        )
+            # 7.2 Generate race engineer prompt
+            prompt = generate_prompt(user_input, telemetry_snapshot)
 
-        reply = response.choices[0].message.content
-        print(f"Engineer: {reply}")
+            # 7.3 Call OpenAI
+            client = openai.OpenAI()
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a calm British F1 race engineer."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
 
-        engine.say(reply)
-        engine.runAndWait()
+            reply = response.choices[0].message.content.strip()
+            print(f"\nEngineer: {reply}")
 
-    except sr.UnknownValueError:
-        print("Didn't catch that.")
-    except Exception as e:
-        print(f"Error: {e}")
+            engine.say(reply)
+            engine.runAndWait()
+
+        except sr.UnknownValueError:
+            print("Didn't catch that.")
+        except Exception as e:
+            print(f"Error: {e}")
+
+except KeyboardInterrupt:
+    print("\nExiting...")
+    telemetry.stop()
