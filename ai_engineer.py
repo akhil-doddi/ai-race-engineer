@@ -5,6 +5,13 @@
 import openai
 import speech_recognition as sr
 import pyttsx3
+import json
+
+# Load telemetry data
+with open('telemetry.json', 'r') as f:
+    telemetry_feed = json.load(f)
+
+telemetry_index = 0
 
 # 1. Set your API key
 openai.api_key = "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"  # Keep this secret in actual use
@@ -17,52 +24,47 @@ engine.setProperty('voice', 'com.apple.speech.synthesis.voice.daniel')
 # 3. Initialize recognizer
 r = sr.Recognizer()
 
-# 4. Simulated race data
-race_data = {
-    'last_lap_time': '1:32.4',
-    'car_ahead_gap': 2.3,
-    'tire_wear': 61,
-    'position': 4,
-    'strategy': 'Hold position and box in 5 laps'
-}
+# 4. Simulated telemetry feed
+telemetry_feed = [
+    {"lap": 15, "position": "P4", "gap_ahead": "2.3s", "gap_behind": "1.1s", "tire_wear": "61%", "lap_time": "1:32.4", "fuel_left": "5 laps"},
+    {"lap": 16, "position": "P4", "gap_ahead": "2.1s", "gap_behind": "1.4s", "tire_wear": "63%", "lap_time": "1:32.1", "fuel_left": "4 laps"},
+    {"lap": 17, "position": "P3", "gap_ahead": "1.8s", "gap_behind": "0.9s", "tire_wear": "65%", "lap_time": "1:31.9", "fuel_left": "3 laps"},
+    {"lap": 18, "position": "P3", "gap_ahead": "1.5s", "gap_behind": "1.2s", "tire_wear": "68%", "lap_time": "1:31.7", "fuel_left": "2 laps"},
+]
+telemetry_index = 0
 
-# 5. Prompt generator
-def generate_race_prompt(user_input, race_data):
-    if "lap" in user_input.lower():
-        return f"Driver asked about lap times. Last lap was {race_data['last_lap_time']}. Car ahead is {race_data['car_ahead_gap']}s ahead."
-
-    if "tire" in user_input.lower():
-        return f"Driver asked about tire wear. Current tire wear is {race_data['tire_wear']}%. Strategy is: {race_data['strategy']}."
-
-    if "position" in user_input.lower():
-        return f"Driver asked about position. Currently P{race_data['position']}, {race_data['car_ahead_gap']}s behind the car ahead."
-
-    if "strategy" in user_input.lower():
-        return f"Driver asked for race strategy. Strategy: {race_data['strategy']}."
-
-    return f"Driver query: {user_input}. Use current data: {race_data} to respond calmly and briefly."
-
-
-# 6. Main loop
+# 5. Main loop
 while True:
     with sr.Microphone() as source:
-        print("\n��️ Speak...")
+        print("\n🎙️ Speak...")
         audio = r.listen(source)
 
     try:
         user_input = r.recognize_google(audio)
         print(f"You said: {user_input}")
 
-        # Build dynamic prompt
-        race_prompt = generate_race_prompt(user_input, race_data)
+        # Rotate through telemetry
+        telemetry = telemetry_feed[telemetry_index % len(telemetry_feed)]
+        telemetry_index += 1
 
-        # Chat API call
+        # Build telemetry string
+        telemetry_prompt = (
+            f"Lap {telemetry['lap']}. You're in {telemetry['position']}, "
+            f"{telemetry['gap_ahead']} to car ahead, {telemetry['gap_behind']} behind. "
+            f"Tire wear at {telemetry['tire_wear']}, last lap was {telemetry['lap_time']}, "
+            f"fuel left for {telemetry['fuel_left']}."
+        )
+
+        # OpenAI chat call with telemetry-enhanced system prompt
         client = openai.OpenAI()
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are an F1 race engineer. Be calm, British, and precise."},
-                {"role": "user", "content": race_prompt}
+                {
+                    "role": "system",
+                    "content": f"You are an F1 race engineer. Be calm, British, and precise. Use this telemetry: {telemetry_prompt}"
+                },
+                {"role": "user", "content": user_input}
             ]
         )
 
@@ -76,3 +78,4 @@ while True:
         print("Didn't catch that.")
     except Exception as e:
         print(f"Error: {e}")
+        
