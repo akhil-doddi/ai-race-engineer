@@ -7,7 +7,7 @@ import speech_recognition as sr
 import pyttsx3
 
 # 1. Set your API key
-openai.api_key = "sk-..."  # Keep this secret in actual use
+openai.api_key = "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"  # Keep this secret in actual use
 
 # 2. Initialize voice engine
 engine = pyttsx3.init()
