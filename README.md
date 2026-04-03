@@ -1,100 +1,144 @@
-# AI Race Engineer Project
-
 # 🏎️ AI Race Engineer
 
-**AI Race Engineer** is a voice-interactive assistant for simulating Formula 1-style radio updates, strategy insights, and telemetry analysis. Built for offline use with a local LLM, it can be extended to use OpenAI's GPT-3.5 or GPT-4 for faster and richer responses.
+A real-time AI-powered Formula 1 race engineer that speaks, listens, and thinks like a pit wall engineer — running on your PC while you race on PS5.
 
 ---
 
-## 📦 Features
+## Project Vision
 
-- 🎙️ Real-time voice input and speech recognition
-- 💬 AI-generated race engineer responses
-- 🧠 Local LLM with `llama-cpp-python` (Nous Hermes 2 - Mistral model)
-- 📈 Prompt understanding of race strategy, lap times, tire wear, and more
-- 🧪 Option to switch to GPT-3.5 (paid) for better performance
-- 📁 Fully documented and ready to showcase in a GitHub portfolio
+Most racing games give you a static strategy screen. This project replaces that with a **live, conversational AI engineer** that monitors your telemetry, detects critical race events, and communicates with you the way a real F1 engineer would on the radio — calm when things are fine, decisive when they aren't.
+
+The system is **event-driven**, not chatbot-driven. The engineer stays silent until something worth saying happens, or until you ask.
 
 ---
 
-## 🛠️ Setup
+## Current Status
 
-### 1. Clone this repo:
-```bash
-git clone https://github.com/your-username/ai-race-engineer.git
-cd ai-race-engineer
+**Phase 1 complete** — Fully working with simulated telemetry.
+
+- Voice and text input modes
+- GPT-4o-mini powered race engineer responses
+- Realistic simulated telemetry (tyre degradation, fuel burn, lap time physics)
+- Proactive pit window alerts (green / yellow / red urgency)
+- Conversation memory across the full race session
+- British male voice output via macOS TTS
+
+---
+
+## System Architecture
+
+```
+PS5 (F1 Game)
+    │
+    │  UDP Telemetry Broadcast (Phase 2+)
+    ▼
+src/telemetry/
+    simulator.py        ← Phase 1: simulated telemetry
+    udp_listener.py     ← Phase 2: live PS5 telemetry (placeholder)
+    │
+    ▼
+src/race_state/
+    state_manager.py    ← converts raw data into clean race_state object
+    │
+    ▼
+src/events/
+    event_detector.py   ← detects pit windows, undercuts, fuel risk
+    │
+    ├──────────────────────────────────┐
+    ▼                                  ▼
+src/communication/             src/voice/
+    response_generator.py          tts_engine.py
+    (GPT-4o-mini)                  voice_input.py
+    │                                  │
+    └──────────────┬───────────────────┘
+                   ▼
+              src/main.py
+              (orchestrator)
 ```
 
-### 2. Install dependencies:
+**Data flow:** Telemetry → Race State → Event Detection → AI (only when needed) → Voice
+
+---
+
+## Setup
+
+### Requirements
+- Python 3.11+
+- macOS (for built-in TTS voices)
+- OpenAI API key
+
+### Installation
+
 ```bash
+git clone https://github.com/akhil-doddi/ai-race-engineer.git
+cd ai-race-engineer
 pip install -r requirements.txt
 ```
 
-### 3. Download the local model (e.g. Nous Hermes 2 - Mistral GGUF)
-Place it in:
+### Configuration
+
+Create a `.env` file in the project root:
+
+```
+OPENAI_API_KEY=your-key-here
+```
+
+### Run
+
 ```bash
-./models/nous-hermes-2-mistral.Q4_0.gguf
-```
-
-Alternatively, switch to GPT-3.5 by updating `ai_engineer.py` with OpenAI credentials.
-
-### 4. Run the assistant:
-```bash
-python3 ai_engineer.py
+python3 -m src.main
 ```
 
 ---
 
-## 🧠 Model Options
-
-| Option         | Description                         |
-|----------------|-------------------------------------|
-| Local LLM      | Mistral GGUF with `llama-cpp-python`|
-| Cloud API      | GPT-3.5 via OpenAI API (paid tier)  |
-
-To switch to GPT-3.5, update `get_ai_response()` in `ai_engineer.py` to use `openai.ChatCompletion.create(...)`.
-
----
-
-## 🚀 Example Voice Command
-
-```
-You: "Give me a race update"
-AI: "Lewis, you're currently in P4 with a last lap of 1:32.4..."
-```
-
----
-
-## 📂 File Structure
+## Project Structure
 
 ```
 ai-race-engineer/
-├── ai_engineer.py         # Main application loop
-├── models/                # Folder for .gguf models
-├── requirements.txt       # Dependencies
-├── README.md              # This documentation
+├── src/
+│   ├── telemetry/          Data ingestion layer
+│   │   ├── simulator.py    Phase 1: simulated telemetry
+│   │   └── udp_listener.py Phase 2: PS5 UDP telemetry (placeholder)
+│   ├── race_state/         State abstraction layer
+│   │   └── state_manager.py
+│   ├── events/             Event detection layer
+│   │   └── event_detector.py
+│   ├── communication/      AI reasoning layer
+│   │   └── response_generator.py
+│   ├── voice/              I/O layer
+│   │   ├── tts_engine.py
+│   │   └── voice_input.py
+│   └── main.py             Runtime orchestrator
+├── config/
+│   └── settings.py         All configuration constants
+├── docs/
+│   ├── architecture.md     System design and data flow
+│   ├── decisions.md        Why key decisions were made
+│   ├── roadmap.md          Phased development plan
+│   └── ai_context.md       Context file for AI assistants
+├── tests/                  Test suite
+├── .env                    API keys (not committed)
+├── requirements.txt        Pinned dependencies
+└── CHANGELOG.md            Version history
 ```
 
 ---
 
-## 🧪 Roadmap
+## Development Roadmap
 
-- [x] Voice-to-AI prompt loop (done ✅)
-- [ ] Telemetry parser
-- [ ] Dashboard or command-line summary view
-- [ ] GPT-4 mode for richer insights
-
----
-
-## 👨‍💻 Author
-Made with ❤️ by [Akhil], guided by ChatGPT.
-
----
-
-## 📄 License
-MIT License
+| Phase | Status | Goal |
+|-------|--------|------|
+| 1 | ✅ Complete | Simulated telemetry, working AI engineer |
+| 2 | 🔜 Next | Live UDP telemetry from PS5 |
+| 3 | Planned | Full event detection system |
+| 4 | Planned | Adaptive communication modes |
+| 5 | Planned | Persistent race memory |
+| 6 | Planned | Voice interaction during live gameplay |
+| 7 | Future | Dockerization |
+| 8 | Future | CI/CD and cloud deployment |
 
 ---
 
-> This is a demo project for learning and showcasing AI + voice integration. Perfect to feature in your resume, portfolio, or GitHub profile.
+## Author
 
+Built by Akhil — F1 fan, Python learner, and aspiring AI engineer.

@@ -1,5 +1,31 @@
-### .gitignore
-__pycache__/
+# Environment — never commit API keys
 .env
+
+# Python
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
 venv/
+.venv/
+env/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Future: Docker
+*.log
+
+# Future: build artifacts
+dist/
+build/
+*.egg-info/

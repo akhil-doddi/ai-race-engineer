@@ -1,4 +1,15 @@
-openai
-speechrecognition
-pyttsx3
-python-dotenv
+# AI Race Engineer — Python Dependencies
+# Pin versions to ensure reproducible installs across environments.
+# Run: pip install -r requirements.txt
+
+# OpenAI API client — GPT-4o-mini for race engineer responses
+openai>=1.30.0
+
+# Speech recognition — converts driver voice to text via Google Speech API
+SpeechRecognition>=3.10.0
+
+# Text-to-speech — macOS voice output for engineer responses
+pyttsx3>=2.90
+
+# Environment variable loading — reads API keys from .env file
+python-dotenv>=1.0.0
