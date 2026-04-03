@@ -1,5 +1,4 @@
-### requirements.txt
 openai
 speechrecognition
 pyttsx3
-dotenv
+python-dotenv

@@ -1,77 +1,77 @@
-import openai
-import speech_recognition as sr
-import pyttsx3
+from app.telemetry import Telemetry
+from app.voice_input import listen_to_driver
+from app.response_generator import ask_gpt
+from app.tts_engine import speak
+from app.pit_strategy import get_pit_recommendation, format_pit_alert
 
-# 1. Set your API key
-openai.api_key = "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"  # Replace with your actual OpenAI key
+def get_input(mode):
+    if mode == "text":
+        return input("⌨️  You: ").strip()
+    else:
+        return listen_to_driver()
 
-# 2. Initialize voice engine
-engine = pyttsx3.init()
-engine.setProperty('rate', 175)
-engine.setProperty('voice', 'com.apple.speech.synthesis.voice.daniel')  # Adjust based on OS
+def main():
+    print("🏎️  AI Race Engineer starting up...")
+    print("─" * 40)
 
-# 3. Initialize recognizer
-r = sr.Recognizer()
+    mode = input("Choose input mode — type 'v' for voice or 't' for text: ").strip().lower()
+    if mode == "v":
+        mode = "voice"
+        print("🎙️  Voice mode selected.")
+    else:
+        mode = "text"
+        print("⌨️  Text mode selected. Type your questions below.")
 
-# 4. Simulated race data
-race_data = {
-    'last_lap_time': '1:32.4',
-    'car_ahead_gap': 2.3,
-    'tire_wear': 61,
-    'position': 4,
-    'strategy': 'Hold position and box in 5 laps'
-}
+    print("─" * 40)
 
-# 5. Prompt generator
-def generate_race_prompt(user_input, race_data):
-    if "lap" in user_input.lower():
-        return f"Driver asked about lap times. Last lap was {race_data['last_lap_time']}. Car ahead is {race_data['car_ahead_gap']}s ahead."
+    telemetry = Telemetry()
+    telemetry.start()
+    print("📡 Telemetry running. Ready for driver input.")
+    print("   (Press Ctrl+C to quit)\n")
 
-    if "tire" in user_input.lower():
-        return f"Driver asked about tire wear. Current tire wear is {race_data['tire_wear']}%. Strategy is: {race_data['strategy']}."
-
-    if "position" in user_input.lower():
-        return f"Driver asked about position. Currently P{race_data['position']}, {race_data['car_ahead_gap']}s behind the car ahead."
-
-    if "strategy" in user_input.lower():
-        return f"Driver asked for race strategy. Strategy: {race_data['strategy']}."
-
-    return f"Driver query: {user_input}. Use current data: {race_data} to respond calmly and briefly."
-
-# 6. Main loop
-while True:
-    with sr.Microphone() as source:
-        print("\n🎙️ Calibrating mic for 1 sec...")
-        r.adjust_for_ambient_noise(source, duration=1)
-        print("🎙️ Speak now...")
-        audio = r.listen(source)
+    history = []
+    last_urgency = 'green'  # track last alert level so we only speak on changes
 
     try:
-        user_input = r.recognize_google(audio)
-        print(f"You said: {user_input}")
+        while True:
+            # --- Proactive pit strategy check ---
+            data = telemetry.get_data()
+            rec = get_pit_recommendation(data)
 
-        # Build dynamic prompt
-        race_prompt = generate_race_prompt(user_input, race_data)
+            # Only print and speak when urgency level changes (e.g. green → yellow)
+            if rec['urgency'] != last_urgency:
+                alert = format_pit_alert(rec)
+                if alert:
+                    print(alert)
+                    spoken_reason = rec['reason'].replace(';', ',').replace('  ', ' ')
+                    if rec['should_pit']:
+                        speak(f"Box box box. {spoken_reason}")
+                    else:
+                        speak(f"Strategy alert. {spoken_reason}")
+                last_urgency = rec['urgency']
 
-        # Chat API call
-        client = openai.OpenAI()
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an F1 race engineer. Be calm, British, and precise."},
-                {"role": "user", "content": race_prompt}
-            ]
-        )
+            # --- Get driver input ---
+            user_input = get_input(mode)
+            if not user_input:
+                continue
 
-        reply = response.choices[0].message.content
-        print(f"Engineer: {reply}")
+            if mode == "voice":
+                print(f"🎙️  Driver: {user_input}")
 
-        engine.say(reply)
-        engine.runAndWait()
+            # --- Fresh telemetry snapshot for the response ---
+            data = telemetry.get_data()
 
-    except sr.UnknownValueError:
-        print("Didn't catch that — please speak clearly.")
-    except sr.RequestError as e:
-        print(f"Speech recognition request failed: {e}")
-    except Exception as e:
-        print(f"Unexpected error: {e}")
+            # --- Ask GPT with full history ---
+            print("⏳ Thinking...")
+            reply, history = ask_gpt(user_input, data, history)
+
+            # --- Print and speak ---
+            print(f"📻 Engineer: {reply}\n")
+            speak(reply)
+
+    except KeyboardInterrupt:
+        print("\n🛑 Shutting down race engineer...")
+        telemetry.stop()
+
+if __name__ == "__main__":
+    main()
