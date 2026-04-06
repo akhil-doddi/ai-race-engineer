@@ -18,16 +18,22 @@
 
 ---
 
-## Phase 2 — Live PS5 Telemetry 🔜 Next
+## Phase 2 — Live PS5 Telemetry ✅ Complete
 
 **Goal:** Replace the simulator with real telemetry from the F1 game on PS5.
 
-**Tasks:**
-- Implement `src/telemetry/udp_listener.py`
-- Parse Codemasters F1 UDP packet format (PacketLapData, PacketCarStatusData, PacketCarTelemetryData)
-- Validate that race_state structure matches simulator output
-- Swap `TelemetrySimulator` for `UDPTelemetryListener` in `src/main.py` (one line change)
-- Test live during actual gameplay session
+**Delivered:**
+- `src/telemetry/udp_listener.py` — fully implemented, parses Codemasters F1 24 binary UDP packets
+- `src/telemetry/udp_sender.py` — race simulation sender for testing without a PS5
+- `src/telemetry/pit_state_machine.py` — FSM (RACING → PIT_ENTRY → PIT_STOP → PIT_EXIT → RACING)
+- `src/telemetry/telemetry_controller.py` — wrapper that applies pit overrides transparently
+- `src/strategy/strategy_tracker.py` — proactive trigger engine (INITIAL_BRIEF, PLAN_CHANGED, PIT_APPROACHING, PIT_NOW, SC_OPPORTUNITY)
+- Safety car detection via weather byte in session packet; single prompt per SC period
+- Post-pit persistent tyre overrides — AI sees fresh rubber data after every stop
+- Auto-pit trigger at 50% tyre life; resets correctly between stints
+- macOS TTS fixed — replaced pyttsx3 (thread-unsafe) with `say` subprocess
+- Two-thread architecture — proactive monitor (1s poll) + reactive main thread
+- Strategy tracker guards — no duplicate BOX calls, no triggers while pitting
 
 **PS5 Setup:**
 1. F1 Game → Settings → Telemetry Settings → UDP Telemetry: ON
@@ -38,7 +44,7 @@
 
 ---
 
-## Phase 3 — Full Event Detection
+## Phase 3 — Full Event Detection 🔜 Next
 
 **Goal:** Expand `event_detector.py` into a comprehensive race event system.
 

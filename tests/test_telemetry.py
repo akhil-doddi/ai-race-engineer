@@ -1,20 +1,24 @@
 """
 tests/test_telemetry.py
 
-Tests for TelemetrySimulator and build_race_state.
+Tests for TelemetrySimulator, build_race_state, PitStateMachine, and TelemetryController.
 
 These tests do NOT start the background thread (no time.sleep calls).
-They test the pure logic: snapshot shape, value bounds, and state normalisation.
+They test the pure logic: snapshot shape, value bounds, state normalisation,
+pit FSM transitions, and controller override application.
 """
 
 import sys
 import os
 import pytest
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.telemetry.simulator import TelemetrySimulator
 from src.race_state.state_manager import build_race_state
+from src.telemetry.pit_state_machine import PitStateMachine, PitState
+from src.telemetry.telemetry_controller import TelemetryController
 
 
 # ---------------------------------------------------------------------------
@@ -257,3 +261,171 @@ class TestGetEvent:
             "laps_remaining": 20,
         }))
         assert "undercut" in event["reason"].lower()
+
+    def test_safety_car_triggers_should_pit_with_old_tyres(self):
+        """SC deployed + tyre age >= SC_MIN_TYRE_AGE → should_pit=True."""
+        event = self.get_event(self._race_state({
+            "track_status": "safety_car",
+            "tire_age_laps": 10,   # well above SC_MIN_TYRE_AGE (5)
+            "laps_remaining": 20,
+        }))
+        assert event["safety_car"] is True
+        assert event["should_pit"] is True
+
+    def test_safety_car_does_not_trigger_with_fresh_tyres(self):
+        """SC deployed but tyre age < SC_MIN_TYRE_AGE → should_pit=False."""
+        event = self.get_event(self._race_state({
+            "track_status": "safety_car",
+            "tire_age_laps": 2,    # below SC_MIN_TYRE_AGE (5)
+            "laps_remaining": 20,
+        }))
+        assert event["safety_car"] is True
+        assert event["should_pit"] is False
+
+    def test_green_flag_safety_car_false(self):
+        """No safety car on green flag conditions."""
+        event = self.get_event(self._race_state({"track_status": "green"}))
+        assert event["safety_car"] is False
+
+
+# ---------------------------------------------------------------------------
+# PitStateMachine — FSM state transitions
+# ---------------------------------------------------------------------------
+
+class TestPitStateMachine:
+
+    def setup_method(self):
+        self.fsm = PitStateMachine()
+
+    def test_initial_state_is_racing(self):
+        assert self.fsm.state == PitState.RACING
+
+    def test_is_pitting_false_initially(self):
+        assert self.fsm.is_pitting is False
+
+    def test_trigger_pit_returns_true_from_racing(self):
+        result = self.fsm.trigger_pit("Medium")
+        assert result is True
+
+    def test_trigger_pit_changes_state(self):
+        self.fsm.trigger_pit("Medium")
+        assert self.fsm.state == PitState.PIT_ENTRY
+
+    def test_is_pitting_true_after_trigger(self):
+        self.fsm.trigger_pit("Medium")
+        assert self.fsm.is_pitting is True
+
+    def test_duplicate_trigger_returns_false(self):
+        """Triggering a pit while already pitting must be rejected."""
+        self.fsm.trigger_pit("Medium")
+        result = self.fsm.trigger_pit("Medium")  # duplicate
+        assert result is False
+
+    def test_compound_rotation_medium_to_hard(self):
+        self.fsm.trigger_pit("Medium")
+        assert self.fsm.new_compound == "Hard"
+
+    def test_compound_rotation_soft_to_medium(self):
+        self.fsm.trigger_pit("Soft")
+        assert self.fsm.new_compound == "Medium"
+
+    def test_compound_rotation_hard_to_medium(self):
+        self.fsm.trigger_pit("Hard")
+        assert self.fsm.new_compound == "Medium"
+
+    def test_get_overrides_empty_in_racing(self):
+        """No overrides when car is racing normally."""
+        assert self.fsm.get_overrides() == {}
+
+    def test_get_overrides_has_tyre_fields_after_trigger(self):
+        """Once pit sequence starts, overrides provide fresh tyre data."""
+        self.fsm.trigger_pit("Medium")
+        # Manually advance to PIT_STOP (where overrides are non-empty)
+        self.fsm.state = PitState.PIT_STOP
+        overrides = self.fsm.get_overrides()
+        assert "tire_wear" in overrides
+        assert "tire_age_laps" in overrides
+        assert "tire_compound" in overrides
+        assert overrides["tire_wear"] == 100.0
+        assert overrides["tire_age_laps"] == 0
+
+
+# ---------------------------------------------------------------------------
+# TelemetryController — override application and pit delegation
+# ---------------------------------------------------------------------------
+
+class TestTelemetryController:
+
+    def _make_mock_source(self, snapshot=None):
+        """Create a mock telemetry source with a fixed snapshot."""
+        if snapshot is None:
+            snapshot = {
+                "lap": 10,
+                "total_laps": 58,
+                "laps_remaining": 48,
+                "position": 5,
+                "gap_ahead": 1.5,
+                "gap_behind": 2.0,
+                "tire_compound": "Medium",
+                "tire_wear": 72.0,
+                "tire_age_laps": 10,
+                "fuel": 70.0,
+                "fuel_per_lap": 1.9,
+                "last_lap_time": "1:32.000",
+                "best_lap_time": "1:31.500",
+                "lap_delta": "+0.500",
+                "speed": 250,
+                "gear": 6,
+                "drs": False,
+            }
+        mock = MagicMock()
+        mock.get_snapshot.return_value = dict(snapshot)
+        return mock
+
+    def test_get_snapshot_returns_dict(self):
+        source = self._make_mock_source()
+        controller = TelemetryController(source)
+        assert isinstance(controller.get_snapshot(), dict)
+
+    def test_raw_data_passes_through_when_not_pitting(self):
+        """When no pit is active, controller returns raw data unchanged."""
+        source = self._make_mock_source()
+        controller = TelemetryController(source)
+        snap = controller.get_snapshot()
+        assert snap["tire_compound"] == "Medium"
+        assert snap["tire_wear"] == 72.0
+
+    def test_is_pitting_false_initially(self):
+        source = self._make_mock_source()
+        controller = TelemetryController(source)
+        assert controller.is_pitting is False
+
+    def test_is_pitting_true_after_trigger(self):
+        source = self._make_mock_source()
+        controller = TelemetryController(source)
+        controller.trigger_pit("Medium")
+        assert controller.is_pitting is True
+
+    def test_trigger_pit_returns_true_first_time(self):
+        source = self._make_mock_source()
+        controller = TelemetryController(source)
+        assert controller.trigger_pit("Medium") is True
+
+    def test_trigger_pit_returns_false_when_already_pitting(self):
+        source = self._make_mock_source()
+        controller = TelemetryController(source)
+        controller.trigger_pit("Medium")
+        assert controller.trigger_pit("Medium") is False
+
+    def test_overrides_applied_during_pit_stop_phase(self):
+        """During PIT_STOP, tyre fields should show fresh compound data."""
+        source = self._make_mock_source()
+        controller = TelemetryController(source)
+        controller.trigger_pit("Medium")
+        # Force the FSM into PIT_STOP state (skip wall-clock wait)
+        controller._pit.state = PitState.PIT_STOP
+        snap = controller.get_snapshot()
+        # Fresh tyre values should override the raw 72% wear
+        assert snap["tire_wear"] == 100.0
+        assert snap["tire_age_laps"] == 0
+        assert snap["tire_compound"] == "Hard"   # Medium → Hard rotation

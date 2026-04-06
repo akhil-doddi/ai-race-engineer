@@ -1,0 +1,310 @@
+"""
+src/strategy/strategy_tracker.py
+
+Converts the AI from a reactive chatbot into a proactive race engineer.
+
+THE CORE PROBLEM THIS SOLVES:
+A chatbot only speaks when asked. A real race engineer speaks when the SITUATION
+demands it. This module is the "brain" that watches telemetry every lap and
+decides when the engineer should speak WITHOUT the driver asking anything.
+
+HOW IT WORKS:
+Every lap, evaluate() is called with the latest race_state and event data.
+It maintains state across laps (pit plan, previous tyre estimate, etc.) and
+returns a list of TRIGGER names when something worth saying has happened.
+main.py then calls the AI with a specific briefing prompt for each trigger.
+
+THE STATE MACHINE:
+    OPEN  →  PLANNED  →  APPROACHING  →  PIT_NOW  →  DONE
+     ↑            ↑
+     └── plan changes update the planned lap and fire PLAN_CHANGED trigger
+
+TRIGGER TYPES (in priority order):
+    INITIAL_BRIEF     — Lap 2: "You are P8 on Medium, planning to box lap 25."
+    PLAN_CHANGED      — Tyre data shifted pit window by 3+ laps: "New box window lap 28."
+    PIT_APPROACHING   — 3 laps before box: "Pit stop in 3 laps, prepare."
+    PIT_NOW           — At or past planned pit lap + should_pit: "Box box box."
+
+ANTI-SPAM PROTECTION:
+    - Each trigger fires ONCE per lap (last_spoken_lap guard)
+    - PIT_NOW only fires once (pit_called flag)
+    - PLAN_CHANGED requires a 3-lap shift to avoid noise from lap-to-lap variance
+"""
+
+
+class StrategyTracker:
+    """
+    Watches telemetry lap-by-lap and fires proactive engineer triggers.
+
+    Usage in main.py:
+        tracker = StrategyTracker()
+        ...
+        triggers = tracker.evaluate(race_state, event)
+        for trigger in triggers:
+            prompt = tracker.build_prompt(trigger, race_state, event)
+            reply, history = ask_engineer(prompt, race_state, history)
+            speak(reply)
+    """
+
+    def __init__(self):
+        # The lap we are currently targeting for the pit stop.
+        # Recalculated every lap from: current_lap + laps_left_on_tyre.
+        self.planned_pit_lap: int | None = None
+
+        # Tracks the previous plan so we can detect meaningful shifts.
+        self._prev_planned_pit_lap: int | None = None
+
+        # Prevents the same trigger firing more than once per lap.
+        self._last_spoken_lap: int = -1
+
+        # Prevents the "pit now" call from repeating every loop once triggered.
+        self._pit_called: bool = False
+
+        # Prevents the initial brief from firing more than once.
+        self._initial_brief_done: bool = False
+
+        # Prevents the SC pit call from repeating during a single SC period.
+        # Reset to False when track_status returns to "green" so future SC
+        # periods are handled correctly.
+        # Named with both aliases for clarity — they refer to the same flag.
+        self._sc_pit_called: bool = False          # internal name
+        self.pit_prompted_during_sc = self._sc_pit_called  # spec alias (kept in sync below)
+
+        # Tracks whether a safety car is currently active.
+        # Set each evaluate() call from the event dict — used for clear
+        # per-lap suppression logic: "if safety_car_active and pit_prompted_during_sc: skip"
+        self.safety_car_active: bool = False
+
+        # Prevents PIT_APPROACHING from firing more than once per stint.
+        # Without this, every time PLAN_CHANGED shifts planned_pit_lap,
+        # a new "3 laps before" threshold appears and PIT_APPROACHING fires again.
+        self._approaching_called: bool = False
+
+    def evaluate(self, race_state: dict, event: dict) -> list[str]:
+        """
+        Evaluate the current race situation and return a list of trigger names.
+        Call this every loop BEFORE asking for driver input.
+
+        Returns [] when the engineer should stay silent.
+        Returns one or more trigger names when the engineer should speak.
+
+        Args:
+            race_state: Clean race_state from build_race_state()
+            event:      Event dict from get_event()
+
+        Returns:
+            List of trigger name strings. Usually 0 or 1. Rarely more.
+        """
+        current_lap  = race_state["lap"]
+        laps_left    = race_state["laps_remaining"]
+        gap_behind   = race_state["gap_behind"]
+        laps_on_tyre = event["laps_left_on_tyre"]
+        should_pit   = event["should_pit"]
+
+        # --- Recalculate planned pit lap from telemetry ---
+        # This is pure maths, not AI guesswork.
+        # planned_pit_lap = what lap will we run out of useful tyre life.
+        if laps_on_tyre > 0 and laps_left > 3:
+            new_plan = current_lap + laps_on_tyre
+            # Cap at total laps - 1 (no point pitting on the last lap)
+            new_plan = min(new_plan, race_state["lap"] + laps_left - 1)
+        else:
+            new_plan = self.planned_pit_lap  # no change if data is unreliable
+
+        triggers = []
+
+        # ── GUARD: only one proactive call per lap ──────────────────────────
+        # Without this, the same trigger fires every 2 seconds (every loop).
+        if current_lap == self._last_spoken_lap:
+            self.planned_pit_lap = new_plan
+            return []
+
+        # ── TRIGGER 1: Initial strategy brief ───────────────────────────────
+        # Fire once on lap 2 so we have at least one lap of wear data.
+        # Lap 1 data is unreliable (fresh tyres, no wear rate established yet).
+        if not self._initial_brief_done and current_lap >= 2:
+            self._initial_brief_done = True
+            self.planned_pit_lap = new_plan
+            self._last_spoken_lap = current_lap
+            return ["INITIAL_BRIEF"]
+
+        # ── TRIGGER 1b: Safety car pit opportunity ───────────────────────────
+        # This trigger is independent of tyre life calculations.
+        # It fires the moment a safety car is confirmed and we haven't already
+        # called the driver in under this SC period.
+        #
+        # WHY IT HAS PRIORITY OVER PLAN_CHANGED AND PIT_APPROACHING:
+        # A safety car window is time-critical — it lasts only a few laps.
+        # Missing it by waiting for the normal pit lap to arrive costs positions.
+        # We return immediately here to avoid the SC call being swamped by
+        # lower-priority triggers firing on the same lap.
+        #
+        # Reset logic: _sc_pit_called is reset to False when track goes green,
+        # so a second SC period later in the race is handled correctly.
+        #
+        # SUPPRESSION RULE (from spec):
+        #   if safety_car_active and pit_prompted_during_sc: skip BOX prompt
+        sc_active = event.get("safety_car", False)
+        self.safety_car_active = sc_active            # expose for external inspection
+
+        if not sc_active:
+            # Green flag — reset so we're ready for any future SC period.
+            self._sc_pit_called = False
+        self.pit_prompted_during_sc = self._sc_pit_called  # keep alias in sync
+
+        # SC ACTIVE — this block mirrors the spec's early return:
+        #   "During SC, call pit ONCE then block ALL normal pit logic"
+        #
+        # Whether we already called or haven't yet, if SC is still out we
+        # return immediately after this block. Normal triggers (PLAN_CHANGED,
+        # PIT_NOW is only valid under green flag.
+        if sc_active:
+            if (not self._sc_pit_called
+                    and not self._pit_called
+                    and event.get("should_pit", False)   # enforces tire_age >= SC_MIN_TYRE_AGE
+                    and current_lap > 5
+                    and laps_left > 8):
+                self._sc_pit_called = True
+                self.pit_prompted_during_sc = True
+                self._last_spoken_lap = current_lap
+                return ["SC_OPPORTUNITY"]
+            # Already called, or conditions not met — return silently.
+            # Spec rule: pit_called_this_sc_period == True → skip, don't repeat.
+            return []
+
+
+        # ── TRIGGER 2: Plan changed significantly ───────────────────────────
+        # Fire when the tyre estimate shifts the pit window by 3+ laps.
+        # 3-lap threshold prevents noise from lap-to-lap calculation variance.
+        # Only relevant when there's still time to act on the new plan.
+        if (self.planned_pit_lap is not None
+                and new_plan is not None
+                and abs(new_plan - self.planned_pit_lap) >= 3
+                and laps_left > 5):
+            self._prev_planned_pit_lap = self.planned_pit_lap
+            self.planned_pit_lap = new_plan
+            self._last_spoken_lap = current_lap
+            triggers.append("PLAN_CHANGED")
+
+        # ── TRIGGER 3: Pit approaching warning ──────────────────────────────
+        # Warn the driver 3 laps before the box call.
+        # Gives the driver time to prepare mentally and finish a fast sector.
+        # _approaching_called prevents this from re-firing when PLAN_CHANGED
+        # shifts planned_pit_lap to a new value (which creates a new -3 threshold).
+        if (self.planned_pit_lap is not None
+                and current_lap == self.planned_pit_lap - 3
+                and laps_left > 3
+                and not self._pit_called
+                and not self._approaching_called):
+            if "PLAN_CHANGED" not in triggers:  # don't double-speak same lap
+                self._approaching_called = True
+                triggers.append("PIT_APPROACHING")
+                self._last_spoken_lap = current_lap
+
+        # ── TRIGGER 4: Box now ──────────────────────────────────────────────
+        # Fire when we reach the planned pit lap AND the event system agrees.
+        # should_pit=True means tyre life or stint age confirms it's time.
+        if (not self._pit_called
+                and self.planned_pit_lap is not None
+                and current_lap >= self.planned_pit_lap
+                and should_pit
+                and laps_left > 2):
+            self._pit_called = True
+            self._last_spoken_lap = current_lap
+            triggers.append("PIT_NOW")
+
+        # Update stored plan (may have changed this lap)
+        self.planned_pit_lap = new_plan
+
+        return triggers
+
+    def reset_pit(self):
+        """
+        Call this after a pit stop is confirmed, so the tracker can
+        monitor the next stint. Clears the pit-called flag and plan.
+        """
+        self._pit_called = False
+        self._approaching_called = False  # fresh stint gets its own warning
+        # NOTE: _sc_pit_called is NOT reset here.
+        # It resets only when track goes green (end of SC period), handled in evaluate().
+        # If reset_pit() cleared it, a second SC_OPPORTUNITY would fire for the same
+        # SC period immediately after the first call triggered the reset.
+        self._initial_brief_done = True   # keep True — brief already given
+        self.planned_pit_lap = None
+        self._prev_planned_pit_lap = None
+        self._last_spoken_lap = -1
+
+    # -----------------------------------------------------------------------
+    # Prompt builders — these are the instructions sent to the AI for each
+    # proactive trigger. They are tight, specific, and radio-style.
+    # The AI is told WHAT to say, not asked to decide whether to say it.
+    # -----------------------------------------------------------------------
+
+    def build_prompt(self, trigger: str, race_state: dict, event: dict) -> str:
+        """
+        Build the briefing prompt for a given trigger.
+
+        This is NOT a question for the AI to answer freely.
+        It is an instruction: "Here is the situation — brief the driver now."
+        The AI's job is to deliver the message clearly in 1-2 sentences.
+
+        Args:
+            trigger:    One of the TRIGGER TYPE constants above.
+            race_state: Current clean race_state.
+            event:      Current event dict.
+
+        Returns:
+            A prompt string to pass as driver_input to ask_engineer().
+        """
+        lap      = race_state["lap"]
+        pos      = race_state["position"]
+        compound = race_state["tire_compound"]
+        life     = race_state["tire_wear"]
+        gap_beh  = race_state["gap_behind"]
+        pit_lap  = self.planned_pit_lap
+        prev_lap = self._prev_planned_pit_lap
+
+        if trigger == "INITIAL_BRIEF":
+            return (
+                f"[ENGINEER BRIEFING] Give the driver a one-sentence race start brief. "
+                f"We are P{pos} on {compound} tyres. "
+                f"Planned pit window is around lap {pit_lap}. "
+                f"Radio style. No questions back to driver."
+            )
+
+        elif trigger == "PLAN_CHANGED":
+            direction = "later" if pit_lap > prev_lap else "earlier"
+            return (
+                f"[ENGINEER BRIEFING] Inform the driver the pit plan has changed. "
+                f"Previous plan was lap {prev_lap}. New target is lap {pit_lap} ({direction}). "
+                f"Tyres currently at {life:.0f}% on {compound}. "
+                f"1-2 sentences. Explain the reason briefly. Radio style."
+            )
+
+        elif trigger == "PIT_APPROACHING":
+            return (
+                f"[ENGINEER BRIEFING] Warn the driver: pit stop in 3 laps. "
+                f"Current lap: {lap}. Box lap: {pit_lap}. "
+                f"One sentence. Prepare the driver. Radio style."
+            )
+
+        elif trigger == "PIT_NOW":
+            return (
+                f"[ENGINEER BRIEFING] Call the driver into the pits NOW. "
+                f"We are on lap {lap}. Tyres at {life:.0f}%. "
+                f"Say box box box. Confirm new tyre compound ({compound} → fresh set). "
+                f"1-2 sentences. Urgent radio style."
+            )
+
+
+        elif trigger == "SC_OPPORTUNITY":
+            return (
+                f"[ENGINEER BRIEFING] Safety car is deployed on lap {lap}. "
+                f"This is a free pit stop window — tyre time loss is neutralised. "
+                f"We are P{pos} on {compound} at {life:.0f}% life, {race_state['laps_remaining']} laps remaining. "
+                f"Call the driver in: say 'safety car, box box box'. "
+                f"Tell them what compound we're going onto. "
+                f"2 sentences maximum. Urgent but calm radio style."
+            )
+
+        return f"[ENGINEER BRIEFING] Brief the driver on current race situation. Lap {lap}, P{pos}."

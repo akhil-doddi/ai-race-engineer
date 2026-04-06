@@ -32,9 +32,8 @@ RATE = 175   # Words per minute. 175 is natural conversation pace.
 # --- Telemetry (Phase 1: Simulator) ---
 # These will be replaced by UDP network config in Phase 2.
 BASE_LAP_TIME = 92.0    # Baseline lap time in seconds (92.0 = 1:32.000)
-TOTAL_LAPS = 50         # Total race distance in laps
+TOTAL_LAPS    = 53      # Total race distance in laps
 
 # --- UDP Telemetry (Phase 2: PS5 Live) ---
-# Uncomment and configure when connecting to PS5.
-# UDP_HOST = "0.0.0.0"      # Listen on all network interfaces
-# UDP_PORT = 20777           # Default F1 game telemetry port
+UDP_HOST = "0.0.0.0"      # Listen on all network interfaces
+UDP_PORT = 20777           # Default F1 game telemetry port

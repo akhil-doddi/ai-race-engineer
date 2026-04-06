@@ -72,24 +72,33 @@ class TestCleanForSpeech:
 
 
 # ---------------------------------------------------------------------------
-# speak() — mocked pyttsx3 engine
+# speak() — mocked subprocess (macOS `say` command)
 # ---------------------------------------------------------------------------
 
 class TestSpeak:
 
-    def test_speak_calls_engine_say(self):
-        """speak() must invoke the underlying TTS engine."""
-        with patch("src.voice.tts_engine._engine") as mock_engine:
+    def test_speak_calls_subprocess_run(self):
+        """speak() must invoke subprocess.run with the `say` command on macOS."""
+        with patch("src.voice.tts_engine.subprocess.run") as mock_run, \
+             patch("src.voice.tts_engine.sys.platform", "darwin"):
             from src.voice import tts_engine
             tts_engine.speak("Tyres critical, box box box.")
-            mock_engine.say.assert_called_once()
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]   # first positional arg is the command list
+            assert args[0] == "say", f"Expected 'say' command, got: {args[0]}"
 
-    def test_speak_runs_and_waits(self):
-        """speak() must call runAndWait so audio plays synchronously."""
-        with patch("src.voice.tts_engine._engine") as mock_engine:
+    def test_speak_passes_cleaned_text(self):
+        """speak() must clean the text before passing to subprocess."""
+        with patch("src.voice.tts_engine.subprocess.run") as mock_run, \
+             patch("src.voice.tts_engine.sys.platform", "darwin"):
             from src.voice import tts_engine
-            tts_engine.speak("Test message.")
-            mock_engine.runAndWait.assert_called_once()
+            tts_engine.speak("You are P14, DRS available.")
+            mock_run.assert_called_once()
+            args = mock_run.call_args[0][0]
+            # The command list's last element is the cleaned text
+            spoken_text = args[-1]
+            assert "Position 14" in spoken_text, "P14 was not expanded before speaking"
+            assert "D R S" in spoken_text, "DRS was not expanded before speaking"
 
 
 # ---------------------------------------------------------------------------

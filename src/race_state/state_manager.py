@@ -62,4 +62,9 @@ def build_race_state(raw: dict) -> dict:
         "speed": int(raw.get("speed", 0)),
         "gear": int(raw.get("gear", 1)),
         "drs": bool(raw.get("drs", False)),
+
+        # Track condition — "green" normally, "safety_car" during SC period
+        # This comes from the simulator (track_status field) or from the UDP
+        # listener in Phase 2. Defaults to "green" if not present.
+        "track_status": str(raw.get("track_status", "green")),
     }
