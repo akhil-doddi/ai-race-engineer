@@ -107,15 +107,23 @@ def speak_proactive(
         "SC_OPPORTUNITY":       "🟡 SAFETY CAR — FREE PIT WINDOW",
         "ENDGAME_MANAGE":       "🏁 ENDGAME — TYRE MANAGEMENT",
         "FINISH_RACE":          "🏁 FINISH — NO MORE STOPS",
+        "FUEL_SAVE":            "⛽ FUEL MANAGEMENT",
         "POSITION_GAINED":      "📈 POSITION GAINED",
         "POSITION_LOST":        "📉 POSITION LOST",
         "DRS_ENABLED":          "💨 DRS AVAILABLE",
     }.get(trigger, "📋 ENGINEER")
 
     print(f"\n{label}")
-    reply, history = ask_engineer(prompt, race_state, history)
-    print(f"📻 Engineer: {reply}\n")
-    speak(reply)
+    try:
+        reply, history = ask_engineer(prompt, race_state, history)
+        print(f"📻 Engineer: {reply}\n")
+        speak(reply)
+    except Exception as exc:
+        # Network errors (API timeout, no connectivity) must not crash the
+        # ProactiveMonitor thread. Log the failure and keep the thread alive.
+        # The next lap's poll will retry normally.
+        print(f"⚠️  Engineer offline ({type(exc).__name__}) — skipping trigger\n")
+        return history
 
     # Trigger pit simulation for any BOX call.
     # tracker.reset_pit() is intentionally NOT called here — see docstring.
@@ -225,16 +233,24 @@ def proactive_monitor(
                 if alert_text:
                     print(alert_text)
                     spoken = event["reason"].replace(";", ",").replace("  ", " ")
-                    if event["should_pit"] and not event.get("endgame_override", False):
+                    # Guard: don't box again if we already pitted under this SC period.
+                    # tracker.pit_prompted_during_sc stays True until track goes green,
+                    # so a second urgency-change (e.g. fresh tyres aged 5 laps into SC)
+                    # won't trigger a duplicate box call on the same safety car period.
+                    sc_already_pitted = (
+                        tracker.safety_car_active and tracker.pit_prompted_during_sc
+                    )
+                    if (event["should_pit"]
+                            and not event.get("endgame_override", False)
+                            and not sc_already_pitted):
                         # Normal pit call — box the car.
                         speak(f"Box box box. {spoken}")
                         controller.trigger_pit(compound)
                         tracker.reset_pit()
                         auto_pit_state["triggered"] = True   # suppress 50% double-trigger
                     else:
-                        # Either a non-pit alert (yellow urgency) OR an endgame
-                        # tyre management call where should_pit was suppressed.
-                        # Both cases warrant a voice alert without boxing the car.
+                        # Either a non-pit alert (yellow urgency), an endgame
+                        # suppression, or a duplicate SC window — speak without boxing.
                         speak(f"Strategy alert. {spoken}")
             last_urgency = event["urgency"]
 

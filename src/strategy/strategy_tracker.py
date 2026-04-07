@@ -30,6 +30,7 @@ TRIGGER TYPES (in priority order):
     POSITION_GAINED   — Driver overtook: "Up to P7, gap ahead 0.8s."
     POSITION_LOST     — Driver was overtaken: "Dropped to P9, defend."
     DRS_ENABLED       — DRS first available this stint: "DRS active, use it."
+    FUEL_SAVE         — Projected fuel short of race end: "Lift and coast."
 
 ANTI-SPAM PROTECTION:
     - Each trigger fires ONCE per lap (last_spoken_lap guard)
@@ -117,6 +118,11 @@ class StrategyTracker:
         #   so the fresh-tyre stint gets its own DRS announcement.
         self._last_drs: bool = False
         self._drs_enabled_announced: bool = False
+
+        # Fuel save mode — fires once when projected fuel falls short of the
+        # race distance. NOT reset in reset_pit() because F1 cars do not
+        # refuel during pit stops; once fuel is tight it stays tight.
+        self._fuel_save_called: bool = False
 
     def evaluate(self, race_state: dict, event: dict) -> list[str]:
         """
@@ -347,7 +353,43 @@ class StrategyTracker:
             self._last_spoken_lap = current_lap
             triggers.append("PIT_NOW")
 
-        # ── TRIGGER 5: Position gained or lost ──────────────────────────────
+        # ── TRIGGER 5: Fuel save mode ────────────────────────────────────────
+        # Fires once when projected fuel falls short of the remaining race
+        # distance — telling the driver to start lifting and coasting.
+        #
+        # CONDITION:
+        #   fuel_laps_remaining < laps_left + 2
+        #     → at current burn rate we run out 2+ laps before the flag.
+        #     → the +2 buffer gives the driver warning before it's critical.
+        #   fuel_laps_remaining > 8
+        #     → not already in the fuel_critical zone (< 5 laps) that
+        #       event_detector handles via the red urgency path. We speak
+        #       about fuel saving, not fuel emergency.
+        #   laps_left > ENDGAME_LAP_THRESHOLD (effectively: not endgame)
+        #     → in endgame the FINISH_RACE / ENDGAME_MANAGE triggers already
+        #       hold the communication slot. Fuel framing at that point adds
+        #       noise rather than actionable information.
+        #   not _fuel_save_called
+        #     → fires exactly once per race. F1 cars do not refuel during pit
+        #       stops, so once fuel is short it stays short. Not in reset_pit().
+        #
+        # PRIORITY — above position/DRS (strategic instruction vs. information):
+        # If fuel is short AND a position change happened on the same lap,
+        # the fuel message is more actionable. Position can wait one lap.
+        fuel_laps_rem = event.get("fuel_laps_remaining", 99.0)
+        if (not triggers
+                and not self._fuel_save_called
+                and fuel_laps_rem < laps_left + 2
+                and fuel_laps_rem > 8
+                and laps_left > 10
+                and current_lap >= 5           # fuel burn rate unreliable on laps 1-4
+                and event.get("race_phase", "mid") != "endgame"
+                and current_lap != self._last_spoken_lap):
+            self._fuel_save_called = True
+            self._last_spoken_lap  = current_lap
+            triggers.append("FUEL_SAVE")
+
+        # ── TRIGGER 6: Position gained or lost ──────────────────────────────
         # Fires when race position changes vs. the previous lap baseline.
         #
         # WHY AT THE END (lowest priority):
@@ -540,6 +582,18 @@ class StrategyTracker:
                 f"Tell the driver clearly: pit stop not required, maintain position, "
                 f"bring the car home. No mention of laps until the stop. "
                 f"1-2 sentences, calm and decisive radio style."
+            )
+
+        elif trigger == "FUEL_SAVE":
+            fuel_laps = round(event.get("fuel_laps_remaining", 0.0), 1)
+            shortfall = round(laps_rem - fuel_laps, 1)
+            return (
+                f"[ENGINEER BRIEFING] Fuel projection is tight. "
+                f"At current burn rate we have {fuel_laps} laps of fuel but "
+                f"{laps_rem} laps remaining — approximately {shortfall} laps short. "
+                f"Instruct the driver to start lifting and coasting to save fuel. "
+                f"Tell them the shortfall and what to do. "
+                f"2 sentences max. Calm, clear radio style."
             )
 
         elif trigger == "DRS_ENABLED":
