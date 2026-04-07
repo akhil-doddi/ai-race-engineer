@@ -5,6 +5,58 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.2] — 2026-04-07 — FINISH_RACE: Suppress Planned Pit Windows in Endgame
+
+### Added
+- `strategy_tracker.py`: `FINISH_RACE` trigger — fires when a pre-planned pit stop window
+  arrives during endgame phase (`race_phase == "endgame"`). Delivers a "pit stop not required,
+  maintain position, bring it home" message instead of a pit warning.
+- `strategy_tracker.py`: `_finish_race_called` flag — prevents `FINISH_RACE` from repeating
+  per stint. Resets in `reset_pit()` so a new stint that also ends in endgame is handled.
+- `strategy_tracker.py`: Endgame guards on `PIT_APPROACHING`, `PIT_NOW`, and `PLAN_CHANGED` —
+  all three now include `event.get("race_phase", "mid") != "endgame"` conditions.
+  `FINISH_RACE` takes over the communication slot; the pit triggers must be silent.
+- `main.py`: `"FINISH_RACE": "🏁 FINISH — NO MORE STOPS"` label entry in `speak_proactive()`.
+
+### Fixed
+- **Bug:** `PIT_APPROACHING` fired with 9 laps remaining, producing "Pit stop in 3 laps; we'll
+  box on Lap 52" despite the race being almost over. Root cause: `PIT_APPROACHING` evaluated
+  purely on lap arithmetic (`current_lap == planned_pit_lap - 3`) with no race phase awareness.
+  Because tyre wear was reported as fuel-critical (not a `should_pit` path), `endgame_override`
+  was never set, so `ENDGAME_MANAGE` never fired as a replacement. The fix adds explicit
+  endgame guards to `PIT_APPROACHING`, `PIT_NOW`, and `PLAN_CHANGED`, and introduces
+  `FINISH_RACE` as the dedicated trigger for this scenario.
+
+---
+
+## [0.3.1] — 2026-04-07 — Endgame Race Strategy Logic
+
+### Added
+- `event_detector.py`: `_get_race_phase()` — classifies race into `"early"`, `"mid"`, or `"endgame"`
+  based on laps remaining. Endgame activates at `ENDGAME_LAP_THRESHOLD = 10` laps remaining.
+- `event_detector.py`: Endgame override block — when in endgame phase and tyre life is above
+  `ENDGAME_CRITICAL_TYRE = 15%`, all pit recommendations are suppressed and replaced with tyre
+  management guidance. SC pits are excluded (free stop remains valid). Tyre below 15% is excluded
+  (safety concern outweighs track position).
+- `event_detector.py`: Two new keys in the returned event dict: `race_phase` and `endgame_override`.
+  `endgame_override = True` signals downstream layers that a pit was suppressed by race phase.
+- `strategy_tracker.py`: `ENDGAME_MANAGE` trigger — fires once per stint when `endgame_override = True`
+  and tyre life is below 40%. Produces survival-mode radio brief instead of pit call.
+- `strategy_tracker.py`: `_endgame_manage_called` flag prevents ENDGAME_MANAGE from repeating.
+  Resets in `reset_pit()` so a second stint ending in endgame is handled correctly.
+- `strategy_tracker.py`: `laps_rem` variable in `build_prompt()` for use in ENDGAME_MANAGE prompt.
+- `main.py`: `ENDGAME_MANAGE` entry in label dict (`🏁 ENDGAME — TYRE MANAGEMENT`).
+
+### Changed
+- `event_detector.py`: `get_event()` now returns `race_phase` and `endgame_override` keys.
+- `main.py`: Auto-pit threshold guard changed from `laps_remaining > 3` to
+  `laps_remaining > ENDGAME_LAP_THRESHOLD`. Prevents 50%-tyre auto-pit in the final 10 laps.
+- `main.py`: Urgency-change box handler now checks `not event.get("endgame_override", False)`
+  before calling `trigger_pit()`. Endgame tyre alerts speak without boxing the car.
+- `main.py`: Imports `ENDGAME_LAP_THRESHOLD` from `event_detector` (single source of truth).
+
+---
+
 ## [0.3.0] — 2026-04-06 — Phase 2 Complete: Live UDP Telemetry
 
 ### Added

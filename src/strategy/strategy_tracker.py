@@ -21,14 +21,17 @@ THE STATE MACHINE:
 
 TRIGGER TYPES (in priority order):
     INITIAL_BRIEF     — Lap 2: "You are P8 on Medium, planning to box lap 25."
+    SC_OPPORTUNITY    — Safety car deployed, free pit window: "Safety car, box box box."
+    ENDGAME_MANAGE    — Final 10 laps, pit suppressed: "Manage tyres and finish the race."
     PLAN_CHANGED      — Tyre data shifted pit window by 3+ laps: "New box window lap 28."
     PIT_APPROACHING   — 3 laps before box: "Pit stop in 3 laps, prepare."
     PIT_NOW           — At or past planned pit lap + should_pit: "Box box box."
 
 ANTI-SPAM PROTECTION:
     - Each trigger fires ONCE per lap (last_spoken_lap guard)
-    - PIT_NOW only fires once (pit_called flag)
+    - PIT_NOW only fires once (_pit_called flag)
     - PLAN_CHANGED requires a 3-lap shift to avoid noise from lap-to-lap variance
+    - ENDGAME_MANAGE fires once per stint (_endgame_manage_called flag)
 """
 
 
@@ -79,6 +82,17 @@ class StrategyTracker:
         # Without this, every time PLAN_CHANGED shifts planned_pit_lap,
         # a new "3 laps before" threshold appears and PIT_APPROACHING fires again.
         self._approaching_called: bool = False
+
+        # Prevents ENDGAME_MANAGE from repeating every lap in the final stint.
+        # Resets in reset_pit() so it fires correctly after a mid-race stop that
+        # leads into a new endgame (e.g. second stint ends in the final 10 laps).
+        self._endgame_manage_called: bool = False
+
+        # Prevents FINISH_RACE from repeating once a planned pit has been
+        # cancelled due to race phase. Unlike ENDGAME_MANAGE (which fires
+        # on tyre wear), FINISH_RACE fires when a pre-planned pit window
+        # arrives but the race is too far gone to benefit from stopping.
+        self._finish_race_called: bool = False
 
     def evaluate(self, race_state: dict, event: dict) -> list[str]:
         """
@@ -173,14 +187,90 @@ class StrategyTracker:
             return []
 
 
+        # ── TRIGGER 1c: Endgame tyre management ─────────────────────────────
+        # Fires once when we enter the final ENDGAME_LAP_THRESHOLD laps with
+        # worn tyres and event_detector has suppressed the pit recommendation.
+        #
+        # WHY THIS IS SEPARATE FROM PLAN_CHANGED:
+        # PLAN_CHANGED communicates a shift in the pit window. ENDGAME_MANAGE
+        # communicates the cancellation of the pit plan entirely — a different
+        # message requiring a different tone. "Pit window moved to lap 32" is
+        # strategy talk. "No stop, manage tyres, bring it home" is survival talk.
+        #
+        # WHY WE CHECK tyre_wear < 40%:
+        # ENDGAME_MANAGE is only worth saying when the tyres are actually
+        # degraded. If tyre life is 75% with 10 laps left there is nothing
+        # meaningful to communicate — the car is fine. The threshold of 40%
+        # ensures we speak when the driver would otherwise expect a pit call.
+        #
+        # WHY endgame_override GATE:
+        # event_detector sets endgame_override=True only when a pit was actively
+        # suppressed due to race phase. Without this gate, ENDGAME_MANAGE would
+        # fire purely based on laps remaining, producing a false alert on laps
+        # where tyres are still healthy and no pit was ever going to be called.
+        if (event.get("endgame_override", False)
+                and not self._endgame_manage_called
+                and race_state["tire_wear"] < 40.0
+                and current_lap != self._last_spoken_lap):
+            self._endgame_manage_called = True
+            self._last_spoken_lap = current_lap
+            return ["ENDGAME_MANAGE"]
+
+        # ── TRIGGER 1d: Finish race — planned pit cancelled ──────────────────
+        # Fires when a pre-planned pit stop window arrives but we are in
+        # endgame phase (laps_remaining <= ENDGAME_LAP_THRESHOLD).
+        #
+        # WHY THIS IS NEEDED (the specific bug this fixes):
+        # PIT_APPROACHING fires purely on lap arithmetic:
+        #   current_lap == planned_pit_lap - 3
+        # It does not check race phase or should_pit. So when planned_pit_lap
+        # is lap 52 and we reach lap 49 with only 9 laps remaining, it fires
+        # "Pit in 3 laps" — even though the pit is strategically worthless.
+        #
+        # WHY NOT JUST GUARD PIT_APPROACHING:
+        # Suppressing PIT_APPROACHING without replacing it leaves the driver
+        # with no communication at a moment they would expect one. FINISH_RACE
+        # takes over the communication slot and delivers the correct message:
+        # "The planned stop is cancelled — bring it home."
+        #
+        # WHY SEPARATE FROM ENDGAME_MANAGE:
+        # ENDGAME_MANAGE fires reactively to tyre degradation (endgame_override=True,
+        # tyre < 40%). FINISH_RACE fires proactively when a scheduled pit window
+        # arrives during endgame — regardless of tyre wear. Both can be relevant
+        # in the same race but cover different scenarios:
+        #   - Car finishes SC pit on fresh rubber, planned pit at lap 52 arrives
+        #     with tyres still at 55% → ENDGAME_MANAGE won't fire (no override,
+        #     tyre healthy) but FINISH_RACE will (lap 52 approaching in endgame).
+        #   - Car on worn tyres, no planned pit nearby, laps_remaining = 8
+        #     → ENDGAME_MANAGE fires (endgame_override=True, tyre < 40%).
+        #
+        # CONDITION:
+        #   race_phase == "endgame"  — final ENDGAME_LAP_THRESHOLD laps
+        #   planned_pit_lap exists   — there is a pit plan to cancel
+        #   current_lap >= planned_pit_lap - 3  — pit window has arrived or passed
+        #   not _finish_race_called  — don't repeat
+        #   not _pit_called          — don't fire if pit already happened this stint
+        if (event.get("race_phase", "mid") == "endgame"
+                and self.planned_pit_lap is not None
+                and current_lap >= self.planned_pit_lap - 3
+                and not self._finish_race_called
+                and not self._pit_called
+                and current_lap != self._last_spoken_lap):
+            self._finish_race_called = True
+            self._last_spoken_lap = current_lap
+            return ["FINISH_RACE"]
+
         # ── TRIGGER 2: Plan changed significantly ───────────────────────────
         # Fire when the tyre estimate shifts the pit window by 3+ laps.
         # 3-lap threshold prevents noise from lap-to-lap calculation variance.
         # Only relevant when there's still time to act on the new plan.
+        # Suppressed in endgame — plan changes have no strategic value when
+        # the race is nearly over.
         if (self.planned_pit_lap is not None
                 and new_plan is not None
                 and abs(new_plan - self.planned_pit_lap) >= 3
-                and laps_left > 5):
+                and laps_left > 5
+                and event.get("race_phase", "mid") != "endgame"):
             self._prev_planned_pit_lap = self.planned_pit_lap
             self.planned_pit_lap = new_plan
             self._last_spoken_lap = current_lap
@@ -191,11 +281,17 @@ class StrategyTracker:
         # Gives the driver time to prepare mentally and finish a fast sector.
         # _approaching_called prevents this from re-firing when PLAN_CHANGED
         # shifts planned_pit_lap to a new value (which creates a new -3 threshold).
+        #
+        # ENDGAME GUARD: suppressed when race_phase == "endgame".
+        # In endgame, FINISH_RACE (above) intercepts the pit-approaching moment
+        # and delivers the correct "no stop" message. PIT_APPROACHING must not
+        # fire on the same lap or any later lap in the same endgame period.
         if (self.planned_pit_lap is not None
                 and current_lap == self.planned_pit_lap - 3
                 and laps_left > 3
                 and not self._pit_called
-                and not self._approaching_called):
+                and not self._approaching_called
+                and event.get("race_phase", "mid") != "endgame"):
             if "PLAN_CHANGED" not in triggers:  # don't double-speak same lap
                 self._approaching_called = True
                 triggers.append("PIT_APPROACHING")
@@ -204,11 +300,19 @@ class StrategyTracker:
         # ── TRIGGER 4: Box now ──────────────────────────────────────────────
         # Fire when we reach the planned pit lap AND the event system agrees.
         # should_pit=True means tyre life or stint age confirms it's time.
+        #
+        # ENDGAME GUARD: suppressed when race_phase == "endgame".
+        # In normal endgame, event_detector already sets should_pit=False via
+        # endgame_override, so this guard is redundant for most cases. It is
+        # kept explicit here as a safety net for edge cases where the two layers
+        # might disagree (e.g. a plan shift puts planned_pit_lap into endgame
+        # after event_detector has already run for this lap).
         if (not self._pit_called
                 and self.planned_pit_lap is not None
                 and current_lap >= self.planned_pit_lap
                 and should_pit
-                and laps_left > 2):
+                and laps_left > 2
+                and event.get("race_phase", "mid") != "endgame"):
             self._pit_called = True
             self._last_spoken_lap = current_lap
             triggers.append("PIT_NOW")
@@ -224,7 +328,9 @@ class StrategyTracker:
         monitor the next stint. Clears the pit-called flag and plan.
         """
         self._pit_called = False
-        self._approaching_called = False  # fresh stint gets its own warning
+        self._approaching_called = False    # fresh stint gets its own warning
+        self._endgame_manage_called = False # new stint may also end in endgame
+        self._finish_race_called = False    # new stint may also reach endgame
         # NOTE: _sc_pit_called is NOT reset here.
         # It resets only when track goes green (end of SC period), handled in evaluate().
         # If reset_pit() cleared it, a second SC_OPPORTUNITY would fire for the same
@@ -261,6 +367,7 @@ class StrategyTracker:
         compound = race_state["tire_compound"]
         life     = race_state["tire_wear"]
         gap_beh  = race_state["gap_behind"]
+        laps_rem = race_state["laps_remaining"]
         pit_lap  = self.planned_pit_lap
         prev_lap = self._prev_planned_pit_lap
 
@@ -305,6 +412,26 @@ class StrategyTracker:
                 f"Call the driver in: say 'safety car, box box box'. "
                 f"Tell them what compound we're going onto. "
                 f"2 sentences maximum. Urgent but calm radio style."
+            )
+
+        elif trigger == "ENDGAME_MANAGE":
+            return (
+                f"[ENGINEER BRIEFING] We are in the final {laps_rem} laps of the race. "
+                f"Tyres are at {life:.0f}% on {compound}. "
+                f"We are NOT pitting. Track position is more valuable than fresh rubber now. "
+                f"Tell the driver: no stop, manage tyre temperatures, protect the car, "
+                f"bring it home. Switch mindset from strategy mode to survival mode. "
+                f"2 sentences, calm and authoritative radio style."
+            )
+
+        elif trigger == "FINISH_RACE":
+            return (
+                f"[ENGINEER BRIEFING] We are P{pos} with {laps_rem} laps to go. "
+                f"The planned pit stop is cancelled — not enough laps remaining to benefit. "
+                f"Tyres are at {life:.0f}% on {compound}. They will get us to the flag. "
+                f"Tell the driver clearly: pit stop not required, maintain position, "
+                f"bring the car home. No mention of laps until the stop. "
+                f"1-2 sentences, calm and decisive radio style."
             )
 
         return f"[ENGINEER BRIEFING] Brief the driver on current race situation. Lap {lap}, P{pos}."

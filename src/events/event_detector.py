@@ -30,6 +30,47 @@ PIT_STOP_TIME_LOSS = 22.0
 # Prevents calling BOX under SC if we just pitted 1-4 laps ago.
 SC_MIN_TYRE_AGE = 5            # laps
 
+# Endgame phase thresholds.
+#
+# ENDGAME_LAP_THRESHOLD — laps remaining at which the system switches from
+# strategy mode to survival mode. Track position becomes the primary concern
+# and pit recommendations are suppressed unless the tyre is truly finished.
+#
+# ENDGAME_CRITICAL_TYRE — below this tyre life, even in endgame we allow a
+# pit call. The car cannot physically finish on a critically worn tyre, so
+# track position must be sacrificed. Above this threshold we stay out.
+ENDGAME_LAP_THRESHOLD = 10     # laps remaining
+ENDGAME_CRITICAL_TYRE = 15.0   # % tyre life — below this, endgame override is lifted
+
+
+def _get_race_phase(laps_remaining: int, total_laps: int) -> str:
+    """
+    Classify the current point in the race into one of three phases.
+
+    early   — first ~35% of the race; tyre optimisation, no urgency on pit timing.
+    mid     — main racing phase; aggressive strategy, undercut windows, pit planning.
+    endgame — final ENDGAME_LAP_THRESHOLD laps; track position priority,
+              pit recommendations suppressed unless tyre is critically worn.
+
+    WHY A FUNCTION AND NOT INLINE LOGIC:
+    The phase classification is used in both get_event() and can be read by
+    strategy_tracker via the returned event dict. Centralising it here means
+    any future phase boundary changes are made in one place.
+
+    Args:
+        laps_remaining: Laps left in the race.
+        total_laps:     Total scheduled race distance.
+
+    Returns:
+        "early" | "mid" | "endgame"
+    """
+    if laps_remaining <= ENDGAME_LAP_THRESHOLD:
+        return "endgame"
+    progress = (total_laps - laps_remaining) / max(total_laps, 1)
+    if progress < 0.35:
+        return "early"
+    return "mid"
+
 
 def get_event(race_state: dict) -> dict:
     """
@@ -40,12 +81,15 @@ def get_event(race_state: dict) -> dict:
 
     Returns:
         Event dict containing:
-            - urgency        : 'green' | 'yellow' | 'red'
-            - should_pit     : True if pit stop is recommended this lap
-            - reason         : Human-readable explanation string
+            - urgency            : 'green' | 'yellow' | 'red'
+            - should_pit         : True if pit stop is recommended this lap
+            - reason             : Human-readable explanation string
             - laps_left_on_tyre  : Estimated laps remaining on current set
             - fuel_laps_remaining: Estimated laps of fuel remaining
-            - safety_car     : True if safety car is currently deployed
+            - safety_car         : True if safety car is currently deployed
+            - race_phase         : 'early' | 'mid' | 'endgame'
+            - endgame_override   : True when a pit was suppressed due to race phase;
+                                   signals strategy_tracker to fire ENDGAME_MANAGE
     """
     tire_life     = race_state["tire_wear"]
     tire_compound = race_state["tire_compound"]
@@ -182,7 +226,48 @@ def get_event(race_state: dict) -> dict:
             reasons.append(f"car behind closing, only {gap_behind}s behind, defend position")
             urgency = "yellow"
 
-    # End-of-race override — too late to benefit from a pit stop
+    # Endgame race phase override.
+    #
+    # WHY THIS RUNS AFTER ALL OTHER RULES:
+    # We let normal tyre/fuel/gap rules compute their natural verdicts first.
+    # This gives us an honest picture of the car's condition (urgency, reasons).
+    # The override then decides whether to ACT on that verdict (pit) or suppress
+    # it and switch to survival mode. Separating evaluation from action prevents
+    # the normal rules from needing any awareness of race phase.
+    #
+    # WHY SAFETY CAR IS EXCLUDED:
+    # An SC window neutralises the 22-second pit stop time loss. A "free" pit
+    # under safety car is strategically valid even at 9 laps remaining.
+    # Suppressing it would actively harm the driver's race position.
+    #
+    # WHY CRITICAL TYRE IS EXCLUDED:
+    # Below ENDGAME_CRITICAL_TYRE (15%) the car is at genuine risk of a
+    # blow-out or loss of control. Track position cannot outweigh safety.
+    # We lift the override and let the normal pit recommendation stand.
+    race_phase       = _get_race_phase(laps_left, race_state.get("total_laps", 58))
+    endgame_override = False
+
+    if (race_phase == "endgame"
+            and tire_life >= ENDGAME_CRITICAL_TYRE
+            and not safety_car
+            and should_pit):
+        should_pit       = False
+        endgame_override = True
+        # Downgrade from red to yellow — the situation is worth monitoring
+        # and communicating, but no longer demands an immediate pit call.
+        if urgency == "red":
+            urgency = "yellow"
+        # Replace pit-focused reasons with tyre management guidance.
+        # The full context is preserved so the AI can brief the driver correctly.
+        reasons = [
+            f"endgame mode — {laps_left} laps remaining, "
+            f"managing {tire_compound} tyres at {tire_life:.0f}% to the flag — no stop"
+        ]
+
+    # Final override — 3 laps or fewer remaining.
+    # At this point no pit stop can recover the time loss. Bring it home
+    # regardless of tyre condition (unless tyre is critically worn, which
+    # the endgame block above would not have suppressed anyway).
     if laps_left <= 3 and tire_life > 20:
         reasons = ["too late to pit, bring it home"]
         should_pit = False
@@ -196,7 +281,9 @@ def get_event(race_state: dict) -> dict:
         "reason":              reason_str,
         "laps_left_on_tyre":   laps_left_on_tyre,
         "fuel_laps_remaining": fuel_laps_remaining,
-        "safety_car":          safety_car,   # True when track_status == "safety_car"
+        "safety_car":          safety_car,
+        "race_phase":          race_phase,
+        "endgame_override":    endgame_override,
     }
 
 

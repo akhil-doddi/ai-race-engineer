@@ -40,7 +40,7 @@ from src.telemetry.simulator            import TelemetrySimulator
 from src.telemetry.udp_listener         import UDPTelemetryListener
 from src.telemetry.telemetry_controller import TelemetryController
 from src.race_state.state_manager       import build_race_state
-from src.events.event_detector          import get_event, format_alert
+from src.events.event_detector          import get_event, format_alert, ENDGAME_LAP_THRESHOLD
 from src.strategy.strategy_tracker      import StrategyTracker
 from src.communication.response_generator import ask_engineer
 from src.voice.tts_engine               import speak
@@ -105,6 +105,8 @@ def speak_proactive(
         "PIT_APPROACHING":      "⚠️  PIT IN 3 LAPS",
         "PIT_NOW":              "🔴 BOX BOX BOX",
         "SC_OPPORTUNITY":       "🟡 SAFETY CAR — FREE PIT WINDOW",
+        "ENDGAME_MANAGE":       "🏁 ENDGAME — TYRE MANAGEMENT",
+        "FINISH_RACE":          "🏁 FINISH — NO MORE STOPS",
     }.get(trigger, "📋 ENGINEER")
 
     print(f"\n{label}")
@@ -176,14 +178,22 @@ def proactive_monitor(
             stop_event.wait(timeout=1.0)
             continue
 
-        # ── Auto-pit: tyre life < 30% ────────────────────────────────────────
+        # ── Auto-pit: tyre life < 50% ────────────────────────────────────────
         # Fires once per stint. auto_pit_state["triggered"] is reset by
         # on_pit_complete() when the pit simulation finishes, so this fires
         # correctly for every stint — not just the first one.
+        #
+        # ENDGAME GUARD: suppressed when laps_remaining <= ENDGAME_LAP_THRESHOLD.
+        # In the final 10 laps, track position is worth more than fresh rubber.
+        # The event_detector endgame override handles the communication — this
+        # guard just stops the automatic pit trigger from firing regardless.
+        # If the tyre deteriorates to a genuinely critical level (<15%) in
+        # endgame, the urgency-change handler below will catch it (because
+        # event_detector does NOT suppress should_pit for critically worn tyres).
         if (not auto_pit_state["triggered"]
                 and not controller.is_pitting
                 and tyre_life < 50.0
-                and race_state["laps_remaining"] > 3):
+                and race_state["laps_remaining"] > ENDGAME_LAP_THRESHOLD):
             auto_pit_state["triggered"] = True
             print(f"\n⚠️  AUTO-PIT — tyre life {tyre_life:.0f}% below 50% threshold")
             controller.trigger_pit(compound)
@@ -212,12 +222,16 @@ def proactive_monitor(
                 if alert_text:
                     print(alert_text)
                     spoken = event["reason"].replace(";", ",").replace("  ", " ")
-                    if event["should_pit"]:
+                    if event["should_pit"] and not event.get("endgame_override", False):
+                        # Normal pit call — box the car.
                         speak(f"Box box box. {spoken}")
                         controller.trigger_pit(compound)
                         tracker.reset_pit()
-                        auto_pit_state["triggered"] = True   # suppress < 30% double-trigger
+                        auto_pit_state["triggered"] = True   # suppress 50% double-trigger
                     else:
+                        # Either a non-pit alert (yellow urgency) OR an endgame
+                        # tyre management call where should_pit was suppressed.
+                        # Both cases warrant a voice alert without boxing the car.
                         speak(f"Strategy alert. {spoken}")
             last_urgency = event["urgency"]
 

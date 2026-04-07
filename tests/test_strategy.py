@@ -285,6 +285,227 @@ class TestResetPit:
         tracker.reset_pit()
         assert tracker._sc_pit_called is True   # untouched
 
+    def test_reset_clears_endgame_manage_called(self):
+        """_endgame_manage_called resets on pit — second stint may also end in endgame."""
+        tracker = StrategyTracker()
+        tracker._endgame_manage_called = True
+        tracker.reset_pit()
+        assert tracker._endgame_manage_called is False
+
+    def test_reset_clears_finish_race_called(self):
+        """_finish_race_called resets on pit — new stint may also reach endgame."""
+        tracker = StrategyTracker()
+        tracker._finish_race_called = True
+        tracker.reset_pit()
+        assert tracker._finish_race_called is False
+
+
+# ---------------------------------------------------------------------------
+# FINISH_RACE trigger
+# ---------------------------------------------------------------------------
+
+class TestFinishRace:
+    """
+    FINISH_RACE fires when a planned pit stop window arrives during endgame.
+    This is the fix for the bug where PIT_APPROACHING would announce
+    'Pit in 3 laps' even when only 9 laps remained.
+    """
+
+    def _endgame_ev(self):
+        """Event dict for endgame phase with no pit suppressed (healthy-ish tyre)."""
+        return _event({
+            "should_pit":       False,
+            "race_phase":       "endgame",
+            "endgame_override": False,   # tyre not worn enough to trigger endgame_override
+        })
+
+    def test_finish_race_fires_at_pit_window_in_endgame(self):
+        """The exact bug scenario: lap 49, planned pit 52, laps_remaining 9."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 52
+        state = _race_state({"lap": 49, "laps_remaining": 9})
+        triggers = tracker.evaluate(state, self._endgame_ev())
+        assert "FINISH_RACE" in triggers
+
+    def test_finish_race_suppresses_pit_approaching(self):
+        """PIT_APPROACHING must NOT fire when FINISH_RACE already covers the same moment."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 52
+        state = _race_state({"lap": 49, "laps_remaining": 9})
+        triggers = tracker.evaluate(state, self._endgame_ev())
+        assert "PIT_APPROACHING" not in triggers
+
+    def test_finish_race_fires_only_once(self):
+        """_finish_race_called prevents FINISH_RACE from repeating every lap."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 52
+
+        state49 = _race_state({"lap": 49, "laps_remaining": 9})
+        triggers_49 = tracker.evaluate(state49, self._endgame_ev())
+        assert "FINISH_RACE" in triggers_49
+
+        state50 = _race_state({"lap": 50, "laps_remaining": 8})
+        triggers_50 = tracker.evaluate(state50, self._endgame_ev())
+        assert "FINISH_RACE" not in triggers_50
+
+    def test_finish_race_does_not_fire_in_mid_race(self):
+        """FINISH_RACE must not fire when race_phase is 'mid'."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 30
+        state = _race_state({"lap": 27, "laps_remaining": 30})  # mid-race
+        ev = _event({"race_phase": "mid", "endgame_override": False})
+        triggers = tracker.evaluate(state, ev)
+        assert "FINISH_RACE" not in triggers
+        assert "PIT_APPROACHING" in triggers   # normal flow still works
+
+    def test_finish_race_does_not_fire_without_planned_pit(self):
+        """No planned pit lap → nothing to cancel, FINISH_RACE stays silent."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = None
+        state = _race_state({"lap": 49, "laps_remaining": 9})
+        triggers = tracker.evaluate(state, self._endgame_ev())
+        assert "FINISH_RACE" not in triggers
+
+    def test_finish_race_does_not_fire_if_pit_already_happened(self):
+        """If the driver already pitted this stint, no finish race message needed."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 52
+        tracker._pit_called = True   # pit already happened
+        state = _race_state({"lap": 49, "laps_remaining": 9})
+        triggers = tracker.evaluate(state, self._endgame_ev())
+        assert "FINISH_RACE" not in triggers
+
+    def test_finish_race_reset_allows_refiring_after_pit(self):
+        """After reset_pit(), FINISH_RACE can fire again if new stint also hits endgame."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 52
+        state49 = _race_state({"lap": 49, "laps_remaining": 9})
+        tracker.evaluate(state49, self._endgame_ev())
+        assert tracker._finish_race_called is True
+
+        tracker.reset_pit()
+        assert tracker._finish_race_called is False
+
+        tracker.planned_pit_lap = 56
+        state53 = _race_state({"lap": 53, "laps_remaining": 5})
+        triggers_after_reset = tracker.evaluate(state53, self._endgame_ev())
+        assert "FINISH_RACE" in triggers_after_reset
+
+    def test_pit_approaching_blocked_in_endgame(self):
+        """PIT_APPROACHING must never fire when race_phase == endgame."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 52
+        tracker._finish_race_called = True  # as if FINISH_RACE already fired
+        state = _race_state({"lap": 49, "laps_remaining": 9})
+        triggers = tracker.evaluate(state, self._endgame_ev())
+        assert "PIT_APPROACHING" not in triggers
+
+    def test_pit_now_blocked_in_endgame(self):
+        """PIT_NOW must not fire in endgame even if we've reached the planned lap."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        tracker.planned_pit_lap = 52
+        tracker._finish_race_called = True  # finish already called
+        state = _race_state({"lap": 52, "laps_remaining": 6})
+        ev = _event({"should_pit": True, "race_phase": "endgame", "endgame_override": False})
+        triggers = tracker.evaluate(state, ev)
+        assert "PIT_NOW" not in triggers
+
+
+# ---------------------------------------------------------------------------
+# ENDGAME_MANAGE trigger
+# ---------------------------------------------------------------------------
+
+class TestEndgameManage:
+
+    def _endgame_event(self, tire_wear=30.0):
+        """Event dict with endgame_override=True (pit was suppressed by phase)."""
+        return _event({
+            "should_pit":       False,       # suppressed by endgame override
+            "endgame_override": True,
+            "race_phase":       "endgame",
+        })
+
+    def test_endgame_manage_fires_with_worn_tyre(self):
+        """ENDGAME_MANAGE fires when pit is suppressed and tyre is below 40%."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        state = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 30.0})
+        triggers = tracker.evaluate(state, self._endgame_event())
+        assert "ENDGAME_MANAGE" in triggers
+
+    def test_endgame_manage_does_not_fire_with_healthy_tyre(self):
+        """ENDGAME_MANAGE should stay silent if tyre is above 40% — nothing to manage."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        state = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 75.0})
+        triggers = tracker.evaluate(state, self._endgame_event())
+        assert "ENDGAME_MANAGE" not in triggers
+
+    def test_endgame_manage_fires_only_once(self):
+        """_endgame_manage_called prevents the trigger from repeating every lap."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+
+        state50 = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 30.0})
+        ev = self._endgame_event()
+        triggers_lap50 = tracker.evaluate(state50, ev)
+        assert "ENDGAME_MANAGE" in triggers_lap50
+
+        state51 = _race_state({"lap": 51, "laps_remaining": 7, "tire_wear": 26.0})
+        triggers_lap51 = tracker.evaluate(state51, ev)
+        assert "ENDGAME_MANAGE" not in triggers_lap51
+
+    def test_endgame_manage_does_not_fire_without_override_flag(self):
+        """ENDGAME_MANAGE must not fire if event_detector did not set endgame_override."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        state = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 30.0})
+        normal_ev = _event({"should_pit": True, "endgame_override": False})
+        triggers = tracker.evaluate(state, normal_ev)
+        assert "ENDGAME_MANAGE" not in triggers
+
+    def test_endgame_manage_not_blocked_by_sc(self):
+        """SC active blocks normal triggers — but endgame is after SC block so unreachable during SC."""
+        # During SC, evaluate() returns early before reaching ENDGAME_MANAGE block.
+        # This test confirms ENDGAME_MANAGE does NOT fire during an active SC.
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        state = _race_state({"lap": 50, "laps_remaining": 9, "tire_wear": 30.0})
+        sc_ev = _event({
+            "safety_car":       True,
+            "should_pit":       False,
+            "endgame_override": True,  # even with this set, SC block takes priority
+        })
+        triggers = tracker.evaluate(state, sc_ev)
+        # SC block returns [] immediately — ENDGAME_MANAGE never evaluated
+        assert "ENDGAME_MANAGE" not in triggers
+
+    def test_endgame_manage_reset_allows_refiring_after_pit(self):
+        """After reset_pit(), ENDGAME_MANAGE can fire again for the new stint."""
+        tracker = StrategyTracker()
+        tracker._initial_brief_done = True
+        state = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 30.0})
+        ev = self._endgame_event()
+
+        tracker.evaluate(state, ev)
+        assert tracker._endgame_manage_called is True
+
+        tracker.reset_pit()
+        assert tracker._endgame_manage_called is False
+
+        state51 = _race_state({"lap": 51, "laps_remaining": 7, "tire_wear": 26.0})
+        triggers_after_reset = tracker.evaluate(state51, ev)
+        assert "ENDGAME_MANAGE" in triggers_after_reset
+
 
 # ---------------------------------------------------------------------------
 # build_prompt — prompt string formatting
@@ -320,9 +541,20 @@ class TestBuildPrompt:
         prompt = self.tracker.build_prompt("PIT_APPROACHING", self._state(), _event())
         assert "3" in prompt or "25" in prompt   # 3 laps away or the pit lap itself
 
+    def test_endgame_manage_prompt_contains_no_stop(self):
+        state = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 30.0})
+        prompt = self.tracker.build_prompt("ENDGAME_MANAGE", state, _event())
+        assert "no stop" in prompt.lower() or "not pitting" in prompt.lower() or "staying out" in prompt.lower()
+
+    def test_endgame_manage_prompt_contains_laps_remaining(self):
+        state = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 30.0})
+        prompt = self.tracker.build_prompt("ENDGAME_MANAGE", state, _event())
+        assert "8" in prompt   # laps remaining
+
     def test_prompt_returns_string(self):
         for trigger in ("INITIAL_BRIEF", "PLAN_CHANGED", "PIT_APPROACHING",
-                        "PIT_NOW", "SC_OPPORTUNITY"):
-            result = self.tracker.build_prompt(trigger, self._state(), _event())
+                        "PIT_NOW", "SC_OPPORTUNITY", "ENDGAME_MANAGE"):
+            state = _race_state({"lap": 50, "laps_remaining": 8, "tire_wear": 30.0})
+            result = self.tracker.build_prompt(trigger, state, _event())
             assert isinstance(result, str), f"build_prompt({trigger}) did not return str"
             assert len(result) > 10, f"Prompt for {trigger} looks too short"

@@ -249,8 +249,61 @@ class TestGetEvent:
 
     def test_event_always_has_required_keys(self):
         event = self.get_event(self._race_state())
-        for key in ("urgency", "should_pit", "reason", "laps_left_on_tyre", "fuel_laps_remaining"):
+        for key in ("urgency", "should_pit", "reason", "laps_left_on_tyre",
+                    "fuel_laps_remaining", "race_phase", "endgame_override"):
             assert key in event, f"Missing key: {key}"
+
+    def test_race_phase_mid_during_normal_race(self):
+        """Mid-race state should return phase 'mid'."""
+        event = self.get_event(self._race_state())   # lap 20/58, 38 remaining
+        assert event["race_phase"] == "mid"
+
+    def test_race_phase_endgame_in_final_10_laps(self):
+        """With 8 laps left the phase should be 'endgame'."""
+        event = self.get_event(self._race_state({"laps_remaining": 8}))
+        assert event["race_phase"] == "endgame"
+
+    def test_endgame_suppresses_pit_with_drivable_tyre(self):
+        """Endgame + tyre above ENDGAME_CRITICAL_TYRE → should_pit suppressed."""
+        event = self.get_event(self._race_state({
+            "laps_remaining": 8,
+            "tire_wear": 30.0,       # worn but above 15% critical threshold
+            "tire_age_laps": 25,
+        }))
+        assert event["should_pit"] is False
+        assert event["endgame_override"] is True
+        assert event["race_phase"] == "endgame"
+
+    def test_endgame_does_not_suppress_critical_tyre(self):
+        """Endgame + tyre BELOW ENDGAME_CRITICAL_TYRE → pit still recommended."""
+        event = self.get_event(self._race_state({
+            "laps_remaining": 8,
+            "tire_wear": 10.0,       # below 15% critical threshold
+            "tire_age_laps": 30,
+        }))
+        assert event["should_pit"] is True
+        assert event["endgame_override"] is False
+
+    def test_endgame_does_not_suppress_sc_pit(self):
+        """Safety car in endgame must NOT be suppressed — free stop remains valid."""
+        event = self.get_event(self._race_state({
+            "laps_remaining": 9,
+            "track_status": "safety_car",
+            "tire_wear": 45.0,
+            "tire_age_laps": 10,
+        }))
+        assert event["safety_car"] is True
+        assert event["should_pit"] is True
+        assert event["endgame_override"] is False
+
+    def test_endgame_override_false_when_no_pit_would_have_been_called(self):
+        """endgame_override is only True when a pit was actively suppressed."""
+        event = self.get_event(self._race_state({
+            "laps_remaining": 8,
+            "tire_wear": 85.0,       # healthy tyre — no pit needed anyway
+            "tire_age_laps": 5,
+        }))
+        assert event["endgame_override"] is False
 
     def test_undercut_risk_flagged_when_close(self):
         """Car within 1.5s behind + yellow urgency → undercut should be mentioned."""

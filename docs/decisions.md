@@ -111,6 +111,22 @@ Understanding the reasoning helps future contributors maintain the system's inte
 
 ## ADR-012: StrategyTracker Proactive Trigger System
 
-**Decision:** A dedicated `StrategyTracker` class evaluates telemetry on every lap and returns a list of trigger names when the engineer should speak without being asked. Triggers are: `INITIAL_BRIEF`, `PLAN_CHANGED`, `PIT_APPROACHING`, `PIT_NOW`, `SC_OPPORTUNITY`.
+**Decision:** A dedicated `StrategyTracker` class evaluates telemetry on every lap and returns a list of trigger names when the engineer should speak without being asked. Triggers are: `INITIAL_BRIEF`, `PLAN_CHANGED`, `PIT_APPROACHING`, `PIT_NOW`, `SC_OPPORTUNITY`, `ENDGAME_MANAGE`.
 
-**Why:** A chatbot only speaks when asked. A real race engineer speaks when the situation demands it. Without this layer, the driver would need to ask "should I pit?" at exactly the right moment. The StrategyTracker removes that burden by watching every lap and calling proactively. State flags (`_pit_called`, `_approaching_called`, `_sc_pit_called`) prevent duplicate calls. A `last_spoken_lap` guard ensures at most one proactive message per lap. During a safety car, `return []` (not `pass`) immediately exits the evaluation, blocking all normal triggers — the SC window is time-critical and must not be diluted by lower-priority calls firing on the same lap.
+**Why:** A chatbot only speaks when asked. A real race engineer speaks when the situation demands it. Without this layer, the driver would need to ask "should I pit?" at exactly the right moment. The StrategyTracker removes that burden by watching every lap and calling proactively. State flags (`_pit_called`, `_approaching_called`, `_sc_pit_called`, `_endgame_manage_called`) prevent duplicate calls. A `last_spoken_lap` guard ensures at most one proactive message per lap. During a safety car, `return []` (not `pass`) immediately exits the evaluation, blocking all normal triggers — the SC window is time-critical and must not be diluted by lower-priority calls firing on the same lap.
+
+---
+
+## ADR-013: Endgame Race Phase Logic
+
+**Decision:** In the final `ENDGAME_LAP_THRESHOLD = 10` laps, all pit recommendations are suppressed by a phase-aware override in `event_detector.get_event()`, unless the tyre is critically worn (< 15% life) or a safety car is deployed. The override sets a new `endgame_override` flag in the event dict. The strategy tracker fires a new `ENDGAME_MANAGE` trigger in response, producing a survival-mode radio brief instead of a box call. Two autonomous pit paths in `main.py` (auto-pit at 50%, urgency-change handler) also respect this flag.
+
+**Why the override lives in `event_detector`, not `strategy_tracker`:** The event detector is the single authoritative source for `should_pit`. If the override lived in the strategy tracker, the urgency-change handler and auto-pit path in `main.py` would each need their own independent endgame checks — three scattered places instead of one. By setting `endgame_override = True` in the event dict, every downstream consumer gets a single flag to check.
+
+**Why safety car is excluded:** An SC window neutralises the 22-second pit stop time loss. A safety car pit is strategically valid even at 9 laps remaining. Suppressing it would actively harm the driver's race result.
+
+**Why tyre < 15% is excluded:** Below this threshold the car is at physical risk (tyre blow-out, loss of control). Track position cannot outweigh safety.
+
+**Why `ENDGAME_MANAGE` fires only when tyre life < 40%:** The trigger is informative — it tells the driver we are staying out intentionally on worn tyres. If tyre life is 80% with 10 laps left there is nothing to communicate; the car is fine. The 40% threshold ensures the message only fires when the driver would otherwise expect a pit call.
+
+**Alternative considered:** A dedicated `RacePhaseManager` class that wraps the event dict and applies overrides. Rejected as over-engineering — the override is three lines in `get_event()` and the event dict already carries the result to all consumers.
