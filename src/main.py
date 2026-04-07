@@ -109,6 +109,7 @@ def speak_proactive(
         "FINISH_RACE":          "🏁 FINISH — NO MORE STOPS",
         "POSITION_GAINED":      "📈 POSITION GAINED",
         "POSITION_LOST":        "📉 POSITION LOST",
+        "DRS_ENABLED":          "💨 DRS AVAILABLE",
     }.get(trigger, "📋 ENGINEER")
 
     print(f"\n{label}")

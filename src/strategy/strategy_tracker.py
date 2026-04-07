@@ -29,6 +29,7 @@ TRIGGER TYPES (in priority order):
     PIT_NOW           — At or past planned pit lap + should_pit: "Box box box."
     POSITION_GAINED   — Driver overtook: "Up to P7, gap ahead 0.8s."
     POSITION_LOST     — Driver was overtaken: "Dropped to P9, defend."
+    DRS_ENABLED       — DRS first available this stint: "DRS active, use it."
 
 ANTI-SPAM PROTECTION:
     - Each trigger fires ONCE per lap (last_spoken_lap guard)
@@ -105,6 +106,18 @@ class StrategyTracker:
         self._last_position: int | None = None
         self._prev_position: int | None = None
 
+        # DRS state tracking.
+        # _last_drs: the DRS bool from the previous evaluate() call.
+        #   Used to detect a False → True transition.
+        # _drs_enabled_announced: prevents firing DRS_ENABLED every lap.
+        #   DRS turns on/off multiple times per lap as the car passes through
+        #   DRS zones. Without this flag, the engineer would say "DRS available"
+        #   on every single lap. We fire once per stint — the first time DRS
+        #   becomes available after a new stint starts. Resets in reset_pit()
+        #   so the fresh-tyre stint gets its own DRS announcement.
+        self._last_drs: bool = False
+        self._drs_enabled_announced: bool = False
+
     def evaluate(self, race_state: dict, event: dict) -> list[str]:
         """
         Evaluate the current race situation and return a list of trigger names.
@@ -147,6 +160,7 @@ class StrategyTracker:
         if current_lap == self._last_spoken_lap:
             self.planned_pit_lap = new_plan
             self._last_position  = current_position
+            self._last_drs       = race_state.get("drs", False)
             return []
 
         # ── TRIGGER 1: Initial strategy brief ───────────────────────────────
@@ -369,9 +383,40 @@ class StrategyTracker:
             else:
                 triggers.append("POSITION_LOST")
 
-        # Update stored plan and position baseline for next lap.
+        # ── TRIGGER 6: DRS available ─────────────────────────────────────────
+        # Fires once per stint the first time DRS turns on after being off.
+        #
+        # WHY ONCE PER STINT AND NOT EVERY LAP:
+        # DRS flips on and off multiple times per lap as the car enters and
+        # exits each DRS zone. Firing on every False→True transition would
+        # produce a "DRS available" message on every single racing lap, which
+        # is noise. The useful moment is when DRS BECOMES available for the
+        # first time in a stint — either at race start, after a safety car
+        # period, or on the out-lap after a pit stop (fresh rubber, DRS on).
+        # _drs_enabled_announced ensures it fires exactly once per stint.
+        # reset_pit() clears it so the new stint gets its own announcement.
+        #
+        # WHY not sc_active:
+        # DRS is always disabled under safety car. Announcing "DRS available"
+        # during a safety car period would be incorrect and confusing.
+        #
+        # NOTE: In simulator mode drs is always False — this trigger is
+        # PS5/UDP only. That's by design; the simulator has no DRS zones.
+        current_drs = race_state.get("drs", False)
+        if (not triggers
+                and not sc_active
+                and current_lap >= 3
+                and current_drs
+                and not self._last_drs
+                and not self._drs_enabled_announced):
+            self._drs_enabled_announced = True
+            self._last_spoken_lap = current_lap
+            triggers.append("DRS_ENABLED")
+
+        # Update stored plan, position baseline, and DRS state for next call.
         self.planned_pit_lap = new_plan
         self._last_position  = current_position
+        self._last_drs       = current_drs
 
         return triggers
 
@@ -389,6 +434,10 @@ class StrategyTracker:
         # It re-establishes on the next evaluate() call automatically.
         self._last_position = None
         self._prev_position = None
+        # DRS: reset so the new stint gets a fresh DRS announcement when
+        # the car first enters a DRS zone on the out-lap.
+        self._drs_enabled_announced = False
+        self._last_drs = False
         # NOTE: _sc_pit_called is NOT reset here.
         # It resets only when track goes green (end of SC period), handled in evaluate().
         # If reset_pit() cleared it, a second SC_OPPORTUNITY would fire for the same
@@ -491,6 +540,14 @@ class StrategyTracker:
                 f"Tell the driver clearly: pit stop not required, maintain position, "
                 f"bring the car home. No mention of laps until the stop. "
                 f"1-2 sentences, calm and decisive radio style."
+            )
+
+        elif trigger == "DRS_ENABLED":
+            return (
+                f"[ENGINEER BRIEFING] DRS is now available on this stint. "
+                f"We are P{pos} with {gap_ahe:.1f}s to the car ahead. "
+                f"1 sentence. Tell the driver DRS is active and to use it if "
+                f"within range. Short, sharp radio style."
             )
 
         elif trigger == "POSITION_GAINED":
