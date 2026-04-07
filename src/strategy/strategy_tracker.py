@@ -462,6 +462,30 @@ class StrategyTracker:
 
         return triggers
 
+    def mark_sc_pit_used(self):
+        """
+        Notify the tracker that a pit stop has been triggered under the
+        current safety car session, regardless of which code path called it.
+
+        WHY THIS METHOD EXISTS:
+        There are two independent paths that can trigger a pit stop:
+          1. tracker.evaluate() returning SC_OPPORTUNITY — sets _sc_pit_called=True
+             inside evaluate() itself, so no external call is needed.
+          2. proactive_monitor's urgency-change handler — reacts to event urgency
+             changing to yellow/red with should_pit=True. This path calls
+             controller.trigger_pit() directly and does NOT go through evaluate(),
+             so _sc_pit_called is never set.
+
+        Without this method, path 2 would leave _sc_pit_called=False. Five laps
+        later when tire_age crosses SC_MIN_TYRE_AGE again, urgency changes once
+        more and a second pit call fires under the same SC session.
+
+        main.py calls this immediately after any SC pit via the urgency-change path.
+        After this call, evaluate() correctly returns [] for the rest of the SC session.
+        """
+        self._sc_pit_called = True
+        self.pit_prompted_during_sc = True
+
     def reset_pit(self):
         """
         Call this after a pit stop is confirmed, so the tracker can
