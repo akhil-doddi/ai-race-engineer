@@ -107,6 +107,8 @@ def speak_proactive(
         "SC_OPPORTUNITY":       "🟡 SAFETY CAR — FREE PIT WINDOW",
         "ENDGAME_MANAGE":       "🏁 ENDGAME — TYRE MANAGEMENT",
         "FINISH_RACE":          "🏁 FINISH — NO MORE STOPS",
+        "POSITION_GAINED":      "📈 POSITION GAINED",
+        "POSITION_LOST":        "📉 POSITION LOST",
     }.get(trigger, "📋 ENGINEER")
 
     print(f"\n{label}")

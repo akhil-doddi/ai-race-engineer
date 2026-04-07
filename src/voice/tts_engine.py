@@ -57,9 +57,11 @@ def clean_for_speech(text: str) -> str:
     Transformations applied:
     - P14 → Position 14  (prevents 'page fourteen')
     - DRS → D R S        (spoken as individual letters, not as a word)
+    - — / –  → ,         (em and en dashes become a natural spoken pause)
     """
     text = re.sub(r"\bP(\d+)\b", r"Position \1", text)
     text = text.replace("DRS", "D R S")
+    text = text.replace("—", ",").replace("–", ",")
     return text
 
 

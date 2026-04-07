@@ -23,9 +23,12 @@ TRIGGER TYPES (in priority order):
     INITIAL_BRIEF     — Lap 2: "You are P8 on Medium, planning to box lap 25."
     SC_OPPORTUNITY    — Safety car deployed, free pit window: "Safety car, box box box."
     ENDGAME_MANAGE    — Final 10 laps, pit suppressed: "Manage tyres and finish the race."
+    FINISH_RACE       — Planned pit window arrives in endgame: "No stop, bring it home."
     PLAN_CHANGED      — Tyre data shifted pit window by 3+ laps: "New box window lap 28."
     PIT_APPROACHING   — 3 laps before box: "Pit stop in 3 laps, prepare."
     PIT_NOW           — At or past planned pit lap + should_pit: "Box box box."
+    POSITION_GAINED   — Driver overtook: "Up to P7, gap ahead 0.8s."
+    POSITION_LOST     — Driver was overtaken: "Dropped to P9, defend."
 
 ANTI-SPAM PROTECTION:
     - Each trigger fires ONCE per lap (last_spoken_lap guard)
@@ -94,6 +97,14 @@ class StrategyTracker:
         # arrives but the race is too far gone to benefit from stopping.
         self._finish_race_called: bool = False
 
+        # Tracks race position across laps so we can detect overtakes.
+        # None until the first lap is recorded — prevents a false trigger
+        # on lap 1 where the "previous" position is unknown.
+        # _prev_position stores the position before the change so build_prompt()
+        # can say "P8 → P7" without needing it passed in separately.
+        self._last_position: int | None = None
+        self._prev_position: int | None = None
+
     def evaluate(self, race_state: dict, event: dict) -> list[str]:
         """
         Evaluate the current race situation and return a list of trigger names.
@@ -109,11 +120,12 @@ class StrategyTracker:
         Returns:
             List of trigger name strings. Usually 0 or 1. Rarely more.
         """
-        current_lap  = race_state["lap"]
-        laps_left    = race_state["laps_remaining"]
-        gap_behind   = race_state["gap_behind"]
-        laps_on_tyre = event["laps_left_on_tyre"]
-        should_pit   = event["should_pit"]
+        current_lap      = race_state["lap"]
+        current_position = race_state["position"]
+        laps_left        = race_state["laps_remaining"]
+        gap_behind       = race_state["gap_behind"]
+        laps_on_tyre     = event["laps_left_on_tyre"]
+        should_pit       = event["should_pit"]
 
         # --- Recalculate planned pit lap from telemetry ---
         # This is pure maths, not AI guesswork.
@@ -129,8 +141,12 @@ class StrategyTracker:
 
         # ── GUARD: only one proactive call per lap ──────────────────────────
         # Without this, the same trigger fires every 2 seconds (every loop).
+        # We still update _last_position here so the baseline stays accurate
+        # even on laps where we already spoke — otherwise position could appear
+        # to jump by 2 on the next lap.
         if current_lap == self._last_spoken_lap:
             self.planned_pit_lap = new_plan
+            self._last_position  = current_position
             return []
 
         # ── TRIGGER 1: Initial strategy brief ───────────────────────────────
@@ -317,8 +333,45 @@ class StrategyTracker:
             self._last_spoken_lap = current_lap
             triggers.append("PIT_NOW")
 
-        # Update stored plan (may have changed this lap)
+        # ── TRIGGER 5: Position gained or lost ──────────────────────────────
+        # Fires when race position changes vs. the previous lap baseline.
+        #
+        # WHY AT THE END (lowest priority):
+        # Position changes are informational, not strategic. If PLAN_CHANGED,
+        # PIT_APPROACHING, or PIT_NOW already fired this lap, those messages
+        # matter more. We only speak about position when the lap is otherwise
+        # quiet — `not triggers` ensures we don't double-speak.
+        #
+        # WHY lap >= 3:
+        # Race start is chaotic. Lap 1 positions are grid order, not race order.
+        # By lap 3 the field has sorted itself and gaps are meaningful.
+        #
+        # WHY not sc_active:
+        # Safety car bunches the field and creates artificial position swaps.
+        # Announcing "you've gained a position" under SC is misleading — it
+        # doesn't reflect real racing pace.
+        #
+        # WHY not self._pit_called:
+        # After a BOX call the car exits the pit lane at a different position.
+        # That position change is expected, already handled by the pit sequence
+        # messages, and should not fire a "you dropped to P12" alert.
+        # reset_pit() clears _last_position so the new stint baseline is clean.
+        if (not triggers
+                and self._last_position is not None
+                and current_position != self._last_position
+                and current_lap >= 3
+                and not sc_active
+                and not self._pit_called):
+            self._prev_position = self._last_position
+            self._last_spoken_lap = current_lap
+            if current_position < self._last_position:   # lower number = better
+                triggers.append("POSITION_GAINED")
+            else:
+                triggers.append("POSITION_LOST")
+
+        # Update stored plan and position baseline for next lap.
         self.planned_pit_lap = new_plan
+        self._last_position  = current_position
 
         return triggers
 
@@ -331,6 +384,11 @@ class StrategyTracker:
         self._approaching_called = False    # fresh stint gets its own warning
         self._endgame_manage_called = False # new stint may also end in endgame
         self._finish_race_called = False    # new stint may also reach endgame
+        # Position baseline is cleared so the pit exit position doesn't
+        # register as a "position lost" alert on the first lap of the new stint.
+        # It re-establishes on the next evaluate() call automatically.
+        self._last_position = None
+        self._prev_position = None
         # NOTE: _sc_pit_called is NOT reset here.
         # It resets only when track goes green (end of SC period), handled in evaluate().
         # If reset_pit() cleared it, a second SC_OPPORTUNITY would fire for the same
@@ -366,6 +424,7 @@ class StrategyTracker:
         pos      = race_state["position"]
         compound = race_state["tire_compound"]
         life     = race_state["tire_wear"]
+        gap_ahe  = race_state.get("gap_ahead", 0.0)
         gap_beh  = race_state["gap_behind"]
         laps_rem = race_state["laps_remaining"]
         pit_lap  = self.planned_pit_lap
@@ -432,6 +491,25 @@ class StrategyTracker:
                 f"Tell the driver clearly: pit stop not required, maintain position, "
                 f"bring the car home. No mention of laps until the stop. "
                 f"1-2 sentences, calm and decisive radio style."
+            )
+
+        elif trigger == "POSITION_GAINED":
+            prev_pos = self._prev_position if self._prev_position is not None else pos + 1
+            return (
+                f"[ENGINEER BRIEFING] Driver just gained a position on track. "
+                f"We are now P{pos}, up from P{prev_pos}. "
+                f"Gap to car ahead is {gap_ahe:.1f}s, car behind {gap_beh:.1f}s. "
+                f"1 sentence. Positive, encouraging radio style. "
+                f"Mention the new position and stay focused."
+            )
+
+        elif trigger == "POSITION_LOST":
+            prev_pos = self._prev_position if self._prev_position is not None else pos - 1
+            return (
+                f"[ENGINEER BRIEFING] Driver just lost a position on track. "
+                f"We dropped from P{prev_pos} to P{pos}. "
+                f"Car behind now {gap_beh:.1f}s. "
+                f"1 sentence. Acknowledge it briefly, keep focus forward, radio style."
             )
 
         return f"[ENGINEER BRIEFING] Brief the driver on current race situation. Lap {lap}, P{pos}."
