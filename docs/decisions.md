@@ -130,3 +130,31 @@ Understanding the reasoning helps future contributors maintain the system's inte
 **Why `ENDGAME_MANAGE` fires only when tyre life < 40%:** The trigger is informative — it tells the driver we are staying out intentionally on worn tyres. If tyre life is 80% with 10 laps left there is nothing to communicate; the car is fine. The 40% threshold ensures the message only fires when the driver would otherwise expect a pit call.
 
 **Alternative considered:** A dedicated `RacePhaseManager` class that wraps the event dict and applies overrides. Rejected as over-engineering — the override is three lines in `get_event()` and the event dict already carries the result to all consumers.
+
+---
+
+## ADR-014: Cooldown Applied at Speak Decision, Not at Event Detection
+
+**Decision:** Gap alert cooldowns are enforced in `proactive_monitor` inside `main.py`, at the point where the engineer decides to speak — not inside `get_event()` in `event_detector.py`.
+
+**Why:** The proactive monitor uses urgency-change detection: it only speaks when `event["urgency"] != last_urgency`. If the cooldown were inside `get_event()`, it would return `urgency = "green"` during suppressed laps. This resets `last_urgency` to green on the next poll. When the cooldown expires, urgency transitions green→yellow again — creating a new trigger. The net result is alerts firing *more* frequently (every cooldown period), not less. By keeping the cooldown at the speak decision only, `last_urgency` correctly tracks the true urgency throughout the entire gap window. No new transition fires until the gap genuinely clears past the threshold.
+
+**The invariant this creates:** `last_urgency` always reflects the true current urgency. The cooldown only suppresses the speak call — it never suppresses the urgency reading.
+
+**Alternative considered:** Returning a suppressed urgency from `get_event()` and using a separate `raw_urgency` field for tracking. Rejected because it required every consumer to understand two urgency fields, and still required the same "update last_urgency before the speak block" discipline.
+
+---
+
+## ADR-015: VSC and Full SC — Shared Detection, Branched Decision
+
+**Decision:** VSC and full SC share a single detection path (`track_status in ("safety_car", "virtual_safety_car")`) and the same entry point in `strategy_tracker.evaluate()`. The branch happens at the strategic decision point — which trigger to fire and what `should_pit` means — not at detection.
+
+**Why the split is here and not earlier:** Guards like "are we in endgame?", "have we already called a pit this period?", "is tyre age above SC_MIN_TYRE_AGE?" apply equally to both SC and VSC. Duplicating them across separate code paths would mean maintaining two copies of the same logic. By entering the same block, both types benefit from the same guards automatically.
+
+**VSC pit conditions:** VSC reduces but does not eliminate pit stop time loss. The field does not compress behind a VSC, so a pit stop still costs track position. The rule: recommend a pit only if `tire_age >= expected_stint - 2` (close to the natural stop anyway) OR `tire_life < 35%` (tyre in danger zone). Below both thresholds the time loss outweighs the benefit — stay out.
+
+**Full SC pit conditions:** The field compresses fully behind a safety car. Pit stop time loss is neutralised. Always recommend a pit if minimum tyre age is met and laps remain.
+
+**VSC_OPPORTUNITY never auto-pits:** Full SC triggers `controller.trigger_pit()` automatically via `speak_proactive()`. VSC does not. VSC delivers a verbal advisory; the driver decides. This prevents the system from automatically pitting on a VSC where staying out is the correct call.
+
+**Why ADR-011 is now superseded:** ADR-011 used the weather byte to detect SC status. This was a PS5-incompatible hack — the real PS5 game repurposes the weather byte for weather, not SC state. Phase 3 #5 fixed this by reading `safetyCarStatus` from its correct position in `PacketSessionData` (offset 124 bytes after the packet header, absolute byte 153 from packet start). Values: 0=green, 1=full SC, 2=VSC, 3=formation lap.

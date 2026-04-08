@@ -40,7 +40,10 @@ from src.telemetry.simulator            import TelemetrySimulator
 from src.telemetry.udp_listener         import UDPTelemetryListener
 from src.telemetry.telemetry_controller import TelemetryController
 from src.race_state.state_manager       import build_race_state
-from src.events.event_detector          import get_event, format_alert, ENDGAME_LAP_THRESHOLD
+from src.events.event_detector          import (
+    get_event, format_alert, ENDGAME_LAP_THRESHOLD,
+    reset_cooldowns, _on_cooldown, _start_cooldown, COOLDOWN_GAP_ALERT,
+)
 from src.strategy.strategy_tracker      import StrategyTracker
 from src.communication.response_generator import ask_engineer
 from src.voice.tts_engine               import speak
@@ -105,6 +108,7 @@ def speak_proactive(
         "PIT_APPROACHING":      "⚠️  PIT IN 3 LAPS",
         "PIT_NOW":              "🔴 BOX BOX BOX",
         "SC_OPPORTUNITY":       "🟡 SAFETY CAR — FREE PIT WINDOW",
+        "VSC_OPPORTUNITY":      "🟡 VIRTUAL SAFETY CAR — ADVISORY",
         "ENDGAME_MANAGE":       "🏁 ENDGAME — TYRE MANAGEMENT",
         "FINISH_RACE":          "🏁 FINISH — NO MORE STOPS",
         "FUEL_SAVE":            "⛽ FUEL MANAGEMENT",
@@ -230,6 +234,8 @@ def proactive_monitor(
             last_track_status = track
             if track == "safety_car":
                 print("\n🟡 SAFETY CAR DEPLOYED — announcing")
+            elif track == "virtual_safety_car":
+                print("\n🟡 VIRTUAL SAFETY CAR — announcing")
             else:
                 print("\n🟢 SAFETY CAR IN — announcing")
 
@@ -237,6 +243,14 @@ def proactive_monitor(
         event = get_event(race_state)
 
         if event["urgency"] != last_urgency:
+            # Update last_urgency FIRST so it always tracks the true urgency level.
+            # This is critical for gap-alert cooldown: if a gap alert is suppressed
+            # below, last_urgency becomes yellow and stays there for as long as the
+            # gap persists — preventing any new green→yellow transitions until the
+            # gap genuinely clears. Without this, updating last_urgency after the
+            # speak block would reset it to green on every cooldown-suppressed poll.
+            last_urgency = event["urgency"]
+
             # Skip all urgency-change announcements while the car is in the pit lane.
             # During PIT_ENTRY the raw UDP data passes through (0% tyre wear), which
             # causes spurious red-urgency changes that would speak "box box box" while
@@ -244,41 +258,69 @@ def proactive_monitor(
             if not controller.is_pitting:
                 alert_text = format_alert(event)
                 if alert_text:
-                    print(alert_text)
-                    spoken = event["reason"].replace(";", ",").replace("  ", " ")
-                    # SC session guard: one pit decision per safety car session.
+                    # Gap alert cooldown — prevents the engineer repeating "attack window"
+                    # or "car behind" every time the gap oscillates back above 1.0s and
+                    # then drops below it again.
                     #
-                    # Two independent paths can trigger a pit under SC:
-                    #   Path A — tracker.evaluate() fires SC_OPPORTUNITY, which sets
-                    #             _sc_pit_called=True inside evaluate() itself.
-                    #   Path B — this urgency-change handler fires when urgency
-                    #             jumps to yellow/red with should_pit=True.
-                    #
-                    # Without coordination, Path B could fire a second SC pit 5 laps
-                    # after Path A (or itself) because tire_age crosses SC_MIN_TYRE_AGE
-                    # again and urgency changes again. tracker.mark_sc_pit_used() writes
-                    # _sc_pit_called=True so that evaluate() returns [] for the rest of
-                    # this SC session, AND pit_prompted_during_sc is True so this same
-                    # check blocks correctly on the next urgency-change iteration.
-                    sc_pit_already_used = (
-                        event.get("safety_car", False) and tracker.pit_prompted_during_sc
+                    # WHY THE COOLDOWN LIVES HERE AND NOT IN get_event():
+                    # If get_event() returned urgency=green during cooldown, last_urgency
+                    # would reset to green on the very next poll — creating a new
+                    # green→yellow transition every time the cooldown expires (3 laps).
+                    # That made alerts MORE frequent, not less. By suppressing only the
+                    # SPEAK decision here (while last_urgency is already updated above),
+                    # the urgency stays correctly at yellow throughout the gap window and
+                    # no new transition fires until the gap genuinely clears.
+                    current_lap = race_state.get("lap", 1)
+                    reason      = event.get("reason", "")
+                    is_gap_alert = (
+                        "attack window" in reason or "car behind closing" in reason
                     )
-                    if (event["should_pit"]
-                            and not event.get("endgame_override", False)
-                            and not sc_pit_already_used):
-                        # Normal or first-SC pit call — box the car.
-                        speak(f"Box box box. {spoken}")
-                        controller.trigger_pit(compound)
-                        tracker.reset_pit()
-                        auto_pit_state["triggered"] = True   # suppress 50% double-trigger
-                        # If this pit was triggered under SC, mark the session as used
-                        # so no further pit calls fire until safety car comes in.
-                        if event.get("safety_car", False):
-                            tracker.mark_sc_pit_used()
+                    if is_gap_alert and _on_cooldown("gap_alert", current_lap, COOLDOWN_GAP_ALERT):
+                        # Cooldown active — engineer stays silent this lap.
+                        pass
                     else:
-                        # Non-pit alert, endgame suppression, or SC session already used.
-                        speak(f"Strategy alert. {spoken}")
-            last_urgency = event["urgency"]
+                        if is_gap_alert:
+                            _start_cooldown("gap_alert", current_lap)
+                        print(alert_text)
+                        spoken = event["reason"].replace(";", ",").replace("  ", " ")
+                        # SC session guard: one pit decision per safety car session.
+                        #
+                        # Two independent paths can trigger a pit under SC:
+                        #   Path A — tracker.evaluate() fires SC_OPPORTUNITY, which sets
+                        #             _sc_pit_called=True inside evaluate() itself.
+                        #   Path B — this urgency-change handler fires when urgency
+                        #             jumps to yellow/red with should_pit=True.
+                        #
+                        # Without coordination, Path B could fire a second SC pit 5 laps
+                        # after Path A (or itself) because tire_age crosses SC_MIN_TYRE_AGE
+                        # again and urgency changes again. tracker.mark_sc_pit_used() writes
+                        # _sc_pit_called=True so that evaluate() returns [] for the rest of
+                        # this SC session, AND pit_prompted_during_sc is True so this same
+                        # check blocks correctly on the next urgency-change iteration.
+                        sc_pit_already_used = (
+                            event.get("safety_car", False) and tracker.pit_prompted_during_sc
+                        )
+                        # VSC advisory — never auto-pit via urgency-change path.
+                        # VSC_OPPORTUNITY (in the tracker path below) handles comms.
+                        # Even if should_pit=True under VSC, we leave the decision
+                        # to the driver — the advisory tells them the option exists.
+                        is_vsc = race_state.get("track_status") == "virtual_safety_car"
+                        if (event["should_pit"]
+                                and not event.get("endgame_override", False)
+                                and not sc_pit_already_used
+                                and not is_vsc):
+                            # Normal or first-SC pit call — box the car.
+                            speak(f"Box box box. {spoken}")
+                            controller.trigger_pit(compound)
+                            tracker.reset_pit()
+                            auto_pit_state["triggered"] = True   # suppress 50% double-trigger
+                            # If this pit was triggered under SC, mark the session as used
+                            # so no further pit calls fire until safety car comes in.
+                            if event.get("safety_car", False):
+                                tracker.mark_sc_pit_used()
+                        else:
+                            # Non-pit alert, endgame suppression, or SC session already used.
+                            speak(f"Strategy alert. {spoken}")
 
         # ── Strategy tracker (proactive pit plan) ────────────────────────────
         # GUARD: skip evaluation while the pit simulation is running.
@@ -346,6 +388,7 @@ def main():
     history    = []
     stop_event = threading.Event()
     tracker    = StrategyTracker()
+    reset_cooldowns()   # clear any stale cooldown state from a previous session
 
     # on_pit_complete: fired by the controller when PIT_EXIT → RACING transition
     # completes. Resets the auto-pit flag via a closure so the next stint's

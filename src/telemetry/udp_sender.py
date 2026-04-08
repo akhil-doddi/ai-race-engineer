@@ -83,10 +83,15 @@ class RaceSimState:
       - Cliff effect: wear rate doubles once avg accumulated wear exceeds 70%
       - Safety car: wear drops to 0.3–0.8%/lap during SC period
 
-    SAFETY CAR:
-      - Deployed between laps 15–28, randomly chosen at race start
-      - Lasts 3–6 laps, then green flag resumes
-      - During SC: gaps compress, lap times slow, track_status = "safety_car"
+    SAFETY CAR / VSC:
+      - Two separate deployment windows, decided at race start, unknown to AI.
+      - VSC (40% chance): deploys laps 3–9, lasts 2–3 laps.
+        At this early stage tyres are fresh — no pit warranted.
+        AI should brief: maintain delta, no stop.
+      - Full SC (60% chance): deploys laps 33–43, lasts 3–6 laps.
+        Tyres are old enough that a free pit under SC is the correct call.
+        AI should brief: box box box.
+      - During SC/VSC: gaps compress, lap times slow, track_status set accordingly.
     """
 
     def __init__(self, total_laps: int = 53, starting_position: int = 8):
@@ -117,11 +122,23 @@ class RaceSimState:
         self.gap_behind_ms    = int(random.uniform(1000, 4000))
 
         # Track condition — mirrors simulator.py field
-        self.track_status     = "green"   # "green" or "safety_car"
+        self.track_status     = "green"   # "green" | "safety_car" | "virtual_safety_car"
 
-        # Safety car timing — decided at race start, unknown to AI
-        self._sc_deploy_lap   = random.randint(15, 28)
-        self._sc_end_lap      = self._sc_deploy_lap + random.randint(3, 6)
+        # Safety car / VSC timing — decided at race start, unknown to AI.
+        # Type chosen first (60% SC / 40% VSC), then deployment lap and duration
+        # are picked from separate windows so the AI sees different scenarios:
+        #   VSC window  : laps 3–9   — tyres fresh, no pit warranted
+        #   Full SC window: laps 33–43 — tyres old, free pit is correct strategy
+        self._sc_type         = random.choices(
+            ["safety_car", "virtual_safety_car"], weights=[60, 40]
+        )[0]
+        if self._sc_type == "virtual_safety_car":
+            self._sc_deploy_lap = random.randint(3, 9)
+            sc_duration         = random.randint(2, 3)
+        else:
+            self._sc_deploy_lap = random.randint(33, 43)
+            sc_duration         = random.randint(3, 6)
+        self._sc_end_lap      = self._sc_deploy_lap + sc_duration
 
         # Instantaneous car state
         self.speed            = 220   # km/h
@@ -203,10 +220,12 @@ class RaceSimState:
         self.lap           += 1   # no cap — loop exits when lap > total_laps
         self.tyre_age_laps += 1
 
-        # ── Safety car status ──────────────────────────────────────────────
+        # ── Safety car / VSC status ────────────────────────────────────────
         if self.lap == self._sc_deploy_lap:
-            self.track_status = "safety_car"
-            print(f"\n🟡 SAFETY CAR DEPLOYED — Lap {self.lap}  (clears Lap {self._sc_end_lap})")
+            self.track_status = self._sc_type
+            label = "VIRTUAL SAFETY CAR" if self._sc_type == "virtual_safety_car" \
+                    else "SAFETY CAR"
+            print(f"\n🟡 {label} DEPLOYED — Lap {self.lap}  (clears Lap {self._sc_end_lap})")
         elif self.lap == self._sc_end_lap + 1:
             self.track_status = "green"
             print(f"\n🟢 SAFETY CAR IN — Lap {self.lap}  (green flag)")
@@ -281,23 +300,46 @@ def _build_header(packet_id: int, player_idx: int, state: RaceSimState) -> bytes
 def _build_session_packet(state: RaceSimState) -> bytes:
     """
     Packet ID 1 — PacketSessionData.
-    We only pack the first few fields (what the listener reads).
-    The real packet is much larger but the listener only needs total_laps.
+
+    We pack the minimum fields the listener needs:
+      - totalLaps     (byte 3 after header)
+      - safetyCarStatus (byte 124 after header)
+
+    WHY THE LAYOUT CHANGED:
+    The previous build repurposed weather byte = 1 to signal SC, and stopped
+    after 104 bytes total. The listener now reads safetyCarStatus from its real
+    position (offset 124 from after-header = byte 153 from packet start).
+    We pad to that position so the listener's struct unpack lands on the right byte.
+
+    safetyCarStatus values written:
+      0 = green flag
+      1 = full safety car
+      2 = virtual safety car (VSC)
     """
     header = _build_header(PACKET_ID_SESSION, 0, state)
 
-    # First 4 bytes after header: weather, trackTemp, airTemp, totalLaps
-    # We repurpose the weather byte to carry track_status:
-    #   0 = green flag, 1 = safety car deployed
-    # The listener reads this byte and maps it back to "green"/"safety_car".
-    weather_byte = 1 if state.track_status == "safety_car" else 0
-    early = struct.pack("<BbbB", weather_byte, 30, 25, state.total_laps)
+    # First 4 bytes after header: weather=0 (clear), trackTemp, airTemp, totalLaps
+    # Weather is now honest (0 = clear sky) — SC is carried by safetyCarStatus below.
+    early = struct.pack("<BbbB", 0, 30, 25, state.total_laps)
 
-    # Pad to realistic session packet size so the listener doesn't see a truncated packet.
-    # Real PacketSessionData is ~644 bytes but the listener only reads the first 33 bytes.
-    padding = bytes(100)
+    # Pad from byte 4 to byte 123 (the 120 bytes of trackLength through marshalZones).
+    # These fields are not read by the listener, so zeros are safe.
+    mid_padding = bytes(120)
 
-    return header + early + padding
+    # safetyCarStatus at offset 124 from after-header.
+    if state.track_status == "virtual_safety_car":
+        sc_byte = 2
+    elif state.track_status == "safety_car":
+        sc_byte = 1
+    else:
+        sc_byte = 0
+    sc_status = struct.pack("<B", sc_byte)
+
+    # Trailing padding — makes the packet a realistic size (real packet is ~644 bytes)
+    # and ensures the listener's size check passes without needing to know exact length.
+    tail_padding = bytes(50)
+
+    return header + early + mid_padding + sc_status + tail_padding
 
 
 def _build_lap_data_packet(state: RaceSimState) -> bytes:
@@ -518,7 +560,8 @@ def run_sender(total_laps: int = 53, position: int = 8, interval: float = 2.0):
     print(f"🚀 UDP Sender — simulating {total_laps}-lap race from P{position}")
     print(f"   Sending to {TARGET_HOST}:{TARGET_PORT} every {interval}s")
     print(f"   Tyre: Medium | Fuel: {state.fuel_kg}kg | Fuel/lap: {state.fuel_per_lap}kg")
-    print(f"   Safety car: planned Lap {state._sc_deploy_lap}–{state._sc_end_lap}")
+    sc_type_label = "VSC" if state._sc_type == "virtual_safety_car" else "SC"
+    print(f"   {sc_type_label}: planned Lap {state._sc_deploy_lap}–{state._sc_end_lap}")
     print(f"   Press Ctrl+C to stop.\n")
 
     lap_timer = 0  # counts how many intervals have passed since last lap advance
@@ -543,7 +586,8 @@ def run_sender(total_laps: int = 53, position: int = 8, interval: float = 2.0):
             life_remaining = 100.0 - avg_wear
             last_lap_str = f"{state.last_lap_ms // 60000}:{(state.last_lap_ms % 60000) / 1000:06.3f}"
 
-            sc_label = " 🟡SC" if state.track_status == "safety_car" else ""
+            sc_label = " 🟡VSC" if state.track_status == "virtual_safety_car" \
+                       else (" 🟡SC" if state.track_status == "safety_car" else "")
             print(
                 f"📤 Lap {state.lap:2d}/{state.total_laps} | "
                 f"P{state.position:2d} | "

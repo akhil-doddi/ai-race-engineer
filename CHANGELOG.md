@@ -5,6 +5,63 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.4] — 2026-04-07 — Phase 3 #5: VSC/SC Behavior Differentiation
+
+### Added
+- `src/telemetry/udp_sender.py`: Separate deployment windows for VSC and full SC.
+  VSC deploys randomly in laps 3–9 (tyres fresh, no pit warranted).
+  Full SC deploys randomly in laps 33–43 (tyres old, free pit is correct strategy).
+  Each type picks its own random lap within its window on every run so no two sessions are identical.
+- `src/events/event_detector.py`: VSC conditional pit logic.
+  Full SC always sets `should_pit = True` (field compressed, pit cost neutralised).
+  VSC sets `should_pit = True` only if `tire_age >= expected_stint - 2` OR `tire_life < 35%`.
+  Below both thresholds VSC sets `should_pit = False` — stay out, hold delta.
+- `src/strategy/strategy_tracker.py`: `VSC_OPPORTUNITY` trigger — fires once per VSC period
+  regardless of `should_pit`. Always delivers a radio advisory. `build_prompt` branches on
+  `should_pit` to produce either a "box this lap" or "maintain delta, stay out" brief.
+- `src/strategy/strategy_tracker.py`: `_vsc_called` flag — prevents `VSC_OPPORTUNITY` from
+  repeating during a single VSC period. Resets to False when track returns to green (same
+  lifecycle as `_sc_pit_called`).
+- `src/main.py`: `"VSC_OPPORTUNITY": "🟡 VIRTUAL SAFETY CAR — ADVISORY"` label in `speak_proactive()`.
+- `src/main.py`: `is_vsc` guard in the urgency-change handler — blocks auto-pit via the
+  urgency path when `track_status == "virtual_safety_car"`, even if `should_pit = True`.
+  VSC decisions are advisory; auto-pit only fires for full SC and tyre-critical alerts.
+
+### Changed
+- `src/strategy/strategy_tracker.py`: SC block in `evaluate()` now branches on `track_status_now`:
+  VSC → fires `VSC_OPPORTUNITY` then returns `[]`.
+  Full SC → fires `SC_OPPORTUNITY` if conditions met then returns `[]`.
+  Structural principle: shared detection infrastructure, branched decision.
+- `src/strategy/strategy_tracker.py`: `SC_OPPORTUNITY` prompt simplified — VSC-specific
+  wording removed now that `VSC_OPPORTUNITY` handles it separately.
+- `src/main.py`: `speak_proactive()` pit trigger guard remains `("PIT_NOW", "SC_OPPORTUNITY")` —
+  `VSC_OPPORTUNITY` is intentionally excluded. VSC advisory never auto-pits the car.
+
+---
+
+## [0.3.3] — 2026-04-07 — Phase 3 #4: Per-Event Gap Alert Cooldown
+
+### Added
+- `src/events/event_detector.py`: Cooldown constants `COOLDOWN_GAP_ALERT = 3` and
+  `COOLDOWN_PIT_WINDOW = 3`. Module-level `_cooldowns` dict with helpers
+  `_on_cooldown(key, lap, n)` and `_start_cooldown(key, lap)`.
+- `src/events/event_detector.py`: `reset_cooldowns()` — clears all cooldown state.
+  Called at race start in `main.py` so prior session state does not carry over.
+- `src/main.py`: Gap alert cooldown applied at the SPEAK decision point in the urgency-change
+  handler. Detects gap alerts by checking the reason string for `"attack window"` or
+  `"car behind closing"`. Suppresses the speak call if the same alert fired within the
+  last 3 laps, but leaves `last_urgency` tracking the true urgency throughout.
+
+### Fixed
+- **Critical bug:** Initial cooldown implementation placed inside `get_event()`, returning
+  `urgency = "green"` during cooldown periods. This reset `last_urgency` to green on every
+  suppressed poll, creating a new green→yellow transition when the cooldown expired — making
+  gap alerts fire MORE frequently, not less. Fix: moved cooldown to the SPEAK decision in
+  `proactive_monitor`; `last_urgency` is now updated before the speak block so it tracks
+  true urgency throughout cooldown windows.
+
+---
+
 ## [0.3.2] — 2026-04-07 — FINISH_RACE: Suppress Planned Pit Windows in Endgame
 
 ### Added

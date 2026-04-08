@@ -78,6 +78,11 @@ class StrategyTracker:
         self._sc_pit_called: bool = False          # internal name
         self.pit_prompted_during_sc = self._sc_pit_called  # spec alias (kept in sync below)
 
+        # Prevents the VSC advisory from repeating during a single VSC period.
+        # Like _sc_pit_called, resets when track goes green so a later VSC
+        # period (if any) fires its own fresh advisory.
+        self._vsc_called: bool = False
+
         # Tracks whether a safety car is currently active.
         # Set each evaluate() call from the event dict — used for clear
         # per-lap suppression logic: "if safety_car_active and pit_prompted_during_sc: skip"
@@ -198,29 +203,44 @@ class StrategyTracker:
         self.safety_car_active = sc_active            # expose for external inspection
 
         if not sc_active:
-            # Green flag — reset so we're ready for any future SC period.
+            # Green flag — reset so we're ready for any future SC/VSC period.
             self._sc_pit_called = False
+            self._vsc_called    = False
         self.pit_prompted_during_sc = self._sc_pit_called  # keep alias in sync
 
-        # SC ACTIVE — this block mirrors the spec's early return:
-        #   "During SC, call pit ONCE then block ALL normal pit logic"
+        # SC/VSC ACTIVE — all normal pit logic (PLAN_CHANGED, PIT_NOW) is
+        # only valid under green flag. We return immediately after this block.
         #
-        # Whether we already called or haven't yet, if SC is still out we
-        # return immediately after this block. Normal triggers (PLAN_CHANGED,
-        # PIT_NOW is only valid under green flag.
+        # FULL SC path: fire SC_OPPORTUNITY once (pit call), then go silent.
+        # VSC path: fire VSC_OPPORTUNITY once (always advisory), then go silent.
+        #   VSC_OPPORTUNITY passes event["should_pit"] to build_prompt so the
+        #   AI knows whether to recommend boxing or holding position.
         if sc_active:
-            if (not self._sc_pit_called
-                    and not self._pit_called
-                    and event.get("should_pit", False)   # enforces tire_age >= SC_MIN_TYRE_AGE
-                    and current_lap > 5
-                    and laps_left > 8):
-                self._sc_pit_called = True
-                self.pit_prompted_during_sc = True
-                self._last_spoken_lap = current_lap
-                return ["SC_OPPORTUNITY"]
-            # Already called, or conditions not met — return silently.
-            # Spec rule: pit_called_this_sc_period == True → skip, don't repeat.
-            return []
+            track_status_now = race_state.get("track_status", "safety_car")
+
+            if track_status_now == "virtual_safety_car":
+                # VSC — fire advisory once, regardless of should_pit value.
+                # build_prompt reads event["should_pit"] to decide the message tone.
+                if (not self._vsc_called
+                        and current_lap != self._last_spoken_lap):
+                    self._vsc_called = True
+                    self._last_spoken_lap = current_lap
+                    return ["VSC_OPPORTUNITY"]
+                # Already briefed this VSC period — stay silent.
+                return []
+            else:
+                # Full SC — fire pit call once if conditions allow.
+                if (not self._sc_pit_called
+                        and not self._pit_called
+                        and event.get("should_pit", False)  # enforces tire_age >= SC_MIN_TYRE_AGE
+                        and current_lap > 5
+                        and laps_left > 8):
+                    self._sc_pit_called = True
+                    self.pit_prompted_during_sc = True
+                    self._last_spoken_lap = current_lap
+                    return ["SC_OPPORTUNITY"]
+                # Already called, or conditions not met — return silently.
+                return []
 
 
         # ── TRIGGER 1c: Endgame tyre management ─────────────────────────────
@@ -581,11 +601,34 @@ class StrategyTracker:
         elif trigger == "SC_OPPORTUNITY":
             return (
                 f"[ENGINEER BRIEFING] Safety car is deployed on lap {lap}. "
-                f"This is a free pit stop window — tyre time loss is neutralised. "
+                f"This is a free pit window — the time loss is neutralised by the SC. "
                 f"We are P{pos} on {compound} at {life:.0f}% life, {race_state['laps_remaining']} laps remaining. "
                 f"Call the driver in: say 'safety car, box box box'. "
                 f"Tell them what compound we're going onto. "
                 f"2 sentences maximum. Urgent but calm radio style."
+            )
+
+        elif trigger == "VSC_OPPORTUNITY":
+            tyre_age = race_state.get("tire_age_laps", 0)
+            should_pit = event.get("should_pit", False)
+            if should_pit:
+                pit_advice = (
+                    f"Tyre age is {tyre_age} laps on {compound} at {life:.0f}% life — "
+                    f"conditions favour a stop. Recommend boxing this lap. "
+                    f"Say 'virtual safety car, box box box' and confirm the tyre choice."
+                )
+            else:
+                pit_advice = (
+                    f"Tyre age is {tyre_age} laps on {compound} at {life:.0f}% life — "
+                    f"tyres are in good shape, pit stop not warranted. "
+                    f"Tell the driver: stay out, maintain the delta, hold position."
+                )
+            return (
+                f"[ENGINEER BRIEFING] Virtual safety car deployed on lap {lap}. "
+                f"VSC reduces but does not eliminate pit stop time loss — it is a smaller "
+                f"opportunity than a full safety car. "
+                f"{pit_advice} "
+                f"2 sentences maximum. Calm, measured radio style."
             )
 
         elif trigger == "ENDGAME_MANAGE":

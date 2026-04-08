@@ -18,13 +18,71 @@ URGENCY LEVELS:
 - yellow : Something worth monitoring. Speak once, don't repeat.
 - red    : Immediate action required. Speak urgently.
 
-COOLDOWN PROTECTION:
-Each event level fires only when urgency changes (green→yellow, yellow→red).
-This prevents the same alert from repeating every loop iteration.
+COOLDOWN PROTECTION (two layers):
+1. Urgency-change gating — proactive_monitor only speaks when urgency changes
+   from the previous poll. This handles most repetition naturally.
+2. Per-event cooldowns (this module) — for events that can oscillate back to
+   green between laps (gap alerts) or that persist at the same urgency for
+   many laps (stint-age pit window), a lap-based cooldown prevents the same
+   alert from firing more than once per cooldown window.
+
+   Only gap alerts and the stint-age pit window need this — critical tyre alerts
+   (< 15%, < 30%) and safety car overrides are always allowed through immediately.
+
+COOLDOWN CONSTANTS:
+- COOLDOWN_GAP_ALERT  : laps between repeated gap (attack/defend) alerts
+- COOLDOWN_PIT_WINDOW : laps between repeated stint-age pit window alerts
+
+COOLDOWN STATE:
+_cooldowns is a module-level dict mapping event key → last lap it fired.
+reset_cooldowns() clears it; call at race start or in tests.
 """
 
 # Seconds lost in a typical F1 pit stop
 PIT_STOP_TIME_LOSS = 22.0
+
+# ── Cooldown constants ───────────────────────────────────────────────────────
+# Number of laps that must pass before the same alert can fire again.
+# Gap alerts: 3 laps prevents noise when a car hovers around the 1.0s mark.
+# Pit window: 3 laps prevents repeating "time to box" every lap once the window
+# opens and urgency change-detection resets (e.g. if urgency briefly returns
+# to green due to a gap fluctuation).
+COOLDOWN_GAP_ALERT  = 3   # laps
+COOLDOWN_PIT_WINDOW = 3   # laps
+
+# Module-level cooldown state — maps event key → lap number when it last fired.
+# Keys used: "gap_ahead", "gap_behind", "pit_window"
+_cooldowns: dict = {}
+
+
+def _on_cooldown(key: str, current_lap: int, cooldown_laps: int) -> bool:
+    """
+    Return True if this event key is still within its cooldown window.
+
+    WHY -999 AS DEFAULT:
+    A key that has never fired has no entry in _cooldowns. Treating the
+    default as lap -999 means (current_lap - (-999)) is always >= cooldown_laps,
+    so a fresh event passes through immediately without any special-case logic.
+    """
+    return (current_lap - _cooldowns.get(key, -999)) < cooldown_laps
+
+
+def _start_cooldown(key: str, current_lap: int) -> None:
+    """Record that this event fired on current_lap."""
+    _cooldowns[key] = current_lap
+
+
+def reset_cooldowns() -> None:
+    """
+    Clear all per-event cooldown state.
+
+    Call this at race start and in unit tests so each test begins with a
+    clean slate. NOT called between stints — gap and pit-window cooldowns
+    should carry over naturally (you don't want an attack alert 1 lap after
+    pitting just because the cooldown was cleared).
+    """
+    _cooldowns.clear()
+
 
 # Minimum laps on current set before an SC pit call is meaningful.
 # Prevents calling BOX under SC if we just pitted 1-4 laps ago.
@@ -99,8 +157,8 @@ def get_event(race_state: dict) -> dict:
     gap_ahead     = race_state["gap_ahead"]
     gap_behind    = race_state["gap_behind"]
     fuel_per_lap  = race_state["fuel_per_lap"]
-    track_status  = race_state.get("track_status", "green")   # "green" | "safety_car"
-    safety_car    = track_status == "safety_car"
+    track_status  = race_state.get("track_status", "green")   # "green" | "safety_car" | "virtual_safety_car"
+    safety_car    = track_status in ("safety_car", "virtual_safety_car")
 
     # --- Compound reference tables (shared across all checks below) ---
     # Expected stint length before the tyre drops off — used for pit window
@@ -199,18 +257,31 @@ def get_event(race_state: dict) -> dict:
     # old (prevents calling BOX if we just pitted 1-4 laps ago), and there must be
     # enough laps left for fresh rubber to be worthwhile.
     if safety_car and tire_age >= SC_MIN_TYRE_AGE and laps_left > 8:
-        # SC overrides all other urgency states — a free pit stop window
-        # is always worth calling regardless of tyre life.
-        # If urgency is already red (critical tyres), we keep it red but
+        # SC/VSC overrides — a reduced pit stop time loss window.
+        # If urgency is already red (critical tyres), keep it red but
         # prepend the SC reason so the driver knows why the call is urgent.
+        sc_label = "virtual safety car" if track_status == "virtual_safety_car" \
+                   else "safety car"
         sc_reason = (
-            f"safety car deployed — free pit window open, "
+            f"{sc_label} deployed — free pit window open, "
             f"{tire_age} laps on {tire_compound} at {tire_life:.0f}% life"
         )
         reasons.insert(0, sc_reason)
         if urgency != "red":
             urgency = "yellow"
-        should_pit = True
+
+        if track_status == "virtual_safety_car":
+            # VSC: smaller time-loss reduction than a full SC.
+            # Only recommend pitting if we are close to the natural pit window
+            # OR the tyre is already significantly worn.
+            # Above those thresholds the pit stop doesn't save enough time
+            # to justify the track position loss — stay out and hold delta.
+            near_pit_window = tire_age >= expected_stint - 2
+            tyre_low        = tire_life < 35.0
+            should_pit      = near_pit_window or tyre_low
+        else:
+            # Full SC: field compresses, pit loss neutralised — always box.
+            should_pit = True
 
     # Gap alerts — only fire once the race has properly started (tire_age >= 1).
     # Before that, gap values are 0.0 defaults from the UDP listener init,

@@ -59,10 +59,32 @@ from config.settings import UDP_HOST, UDP_PORT, TOTAL_LAPS, BASE_LAP_TIME
 HEADER_FMT  = "<HBBBBBQfIIBB"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)   # 29 bytes
 
-# Session data — we only need the first 4 bytes after the header:
+# Session data — first 4 bytes after the header:
 # weather(B), trackTemperature(b), airTemperature(b), totalLaps(B)
 SESSION_EARLY_FMT  = "<BbbB"
 SESSION_EARLY_SIZE = struct.calcsize(SESSION_EARLY_FMT)   # 4 bytes
+
+# Byte offset from the END of the header to the safetyCarStatus field.
+#
+# PacketSessionData layout (F1 24 spec):
+#   weather(B) trackTemp(b) airTemp(b) totalLaps(B)   =  4 bytes
+#   trackLength(H)                                     =  2 bytes
+#   sessionType(B) trackId(b) formula(B)               =  3 bytes
+#   sessionTimeLeft(H) sessionDuration(H)              =  4 bytes
+#   pitSpeedLimit(B) gamePaused(B) isSpectating(B)
+#   spectatorCarIndex(B) sliProNativeSupport(B)
+#   numMarshalZones(B)                                 =  6 bytes
+#   marshalZones[21]  (each: float zoneStart + int8 zoneFlag = 5 bytes)
+#                                                      = 105 bytes
+#   ─────────────────────────────────────────────────────────────
+#   safetyCarStatus(B)                                 at offset 124
+#
+# safetyCarStatus values (F1 24 spec):
+#   0 = No safety car
+#   1 = Full safety car
+#   2 = Virtual safety car (VSC)
+#   3 = Formation lap safety car  (treated same as full SC for strategy)
+SESSION_SC_OFFSET = 124
 
 # LapData: 57 bytes per car, 22 cars in the array.
 # Contains position, current lap, lap times, gaps, pit status.
@@ -139,7 +161,7 @@ class UDPTelemetryListener:
             "speed":          0,
             "gear":           1,
             "drs":            False,
-            "track_status":   "green",   # "green" or "safety_car"
+            "track_status":   "green",   # "green" | "safety_car" | "virtual_safety_car"
         }
 
         # best_lap_secs tracks personal best for delta calculation.
@@ -241,10 +263,24 @@ class UDPTelemetryListener:
     def _parse_session(self, data: bytes):
         """
         ID 1 — PacketSessionData.
-        We only need total_laps from this packet.
-        It arrives once per second, so no need to parse everything.
+        Extracts total_laps and safety car status. Arrives once per second.
+
+        SC DETECTION — WHY WE DON'T USE THE WEATHER BYTE:
+        The original implementation repurposed the weather byte to carry SC state
+        from udp_sender.py (weather=1 = safety car). This worked for the simulator
+        but caused false SC triggers on real PS5 data because the game encodes
+        actual weather in that byte (1 = light cloud, not safety car).
+
+        The real field is safetyCarStatus at offset SESSION_SC_OFFSET (124 bytes)
+        after the header. We read it directly and map to three states:
+          0 = green flag
+          1 = full safety car  → "safety_car"
+          2 = virtual SC (VSC) → "virtual_safety_car"
+          3 = formation lap SC → "safety_car" (same strategy as full SC)
+
+        udp_sender.py now writes safetyCarStatus at the correct offset so it
+        works with this reader. The weather byte in udp_sender is always 0 (clear).
         """
-        # The first 4 bytes after the header are: weather, trackTemp, airTemp, totalLaps
         offset = HEADER_SIZE
         if len(data) < offset + SESSION_EARLY_SIZE:
             return
@@ -252,12 +288,22 @@ class UDPTelemetryListener:
             weather, track_temp, air_temp, total_laps = struct.unpack_from(
                 SESSION_EARLY_FMT, data, offset
             )
-            # weather byte is repurposed to carry track_status from the sender:
-            #   0 = green flag, 1 = safety car deployed.
-            # When connected to a real PS5 game, weather carries actual weather
-            # (0=clear, 1=light cloud, ...) — SC would never be 1, so the mapping
-            # is safe and won't falsely trigger in live mode.
-            track_status = "safety_car" if weather == 1 else "green"
+
+            # Read safetyCarStatus from its correct position in the packet.
+            # If the packet is too short (malformed / old format), fall back to
+            # the weather byte trick used by older udp_sender builds.
+            sc_abs_offset = HEADER_SIZE + SESSION_SC_OFFSET
+            if len(data) >= sc_abs_offset + 1:
+                sc_byte = struct.unpack_from("<B", data, sc_abs_offset)[0]
+                if sc_byte == 2:
+                    track_status = "virtual_safety_car"
+                elif sc_byte in (1, 3):   # 1=full SC, 3=formation lap
+                    track_status = "safety_car"
+                else:
+                    track_status = "green"
+            else:
+                # Short packet — legacy fallback (udp_sender < v0.3.5)
+                track_status = "safety_car" if weather == 1 else "green"
 
             with self._lock:
                 if total_laps > 0:

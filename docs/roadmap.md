@@ -44,20 +44,25 @@
 
 ---
 
-## Phase 3 — Full Event Detection 🔜 Next
+## Phase 3 — Full Event Detection 🔄 In Progress
 
 **Goal:** Expand `event_detector.py` into a comprehensive race event system.
 
-**New events to implement:**
-- `safety_car_deployed` — detected via session packet flag
-- `virtual_safety_car` — lower urgency version
-- `drs_enabled` / `drs_disabled` — per-lap zone tracking
-- `position_gained` / `position_lost` — compared to previous lap
-- `fastest_lap_opportunity` — when within 0.5s of fastest lap on fresh tyres
-- `fuel_save_mode` — project fuel consumption to finish line
-- `push_mode` — recommend attack when gap to car ahead is closing
+**Delivered so far:**
+- ✅ **#1 — Endgame race strategy** (v0.3.1) — final 10 laps suppress pit calls; `ENDGAME_MANAGE` trigger
+- ✅ **#2 — FINISH_RACE trigger** (v0.3.2) — cancels planned pit windows that arrive in endgame phase
+- ✅ **#3 — Position, DRS, Fuel triggers** (v0.3.0) — `POSITION_GAINED`, `POSITION_LOST`, `DRS_ENABLED`, `FUEL_SAVE`
+- ✅ **#4 — Gap alert cooldown** (v0.3.3) — 3-lap cooldown on gap alerts; cooldown gates the speak decision, not urgency calculation
+- ✅ **#5 — VSC + Real PS5 SC detection** (v0.3.4):
+  - `safetyCarStatus` read from correct byte offset in PacketSessionData (not weather byte hack)
+  - VSC as distinct state with conditional pit logic (only pit if near window OR tyre < 35%)
+  - `VSC_OPPORTUNITY` trigger — always advisory, never auto-pits
+  - `SC_OPPORTUNITY` — full pit call, auto-pits the car
+  - `udp_sender.py` test windows: VSC laps 3–9, full SC laps 33–43, randomised each run
 
-**Cooldown system:** Each event type gets a cooldown timer to prevent repeated alerts on the same condition.
+**Remaining:**
+- 🔜 **#6 — Push mode** — rolling 3-lap gap delta buffer; if gap to car ahead is closing consistently, engineer calls a push lap
+- 🔜 **#7 — Fastest lap opportunity** — detect when driver can set fastest lap (fresh tyres, within range of current FL, last stint)
 
 ---
 

@@ -1,6 +1,6 @@
 # System Architecture
 
-This document describes the full architecture of the AI Race Engineer system as of Phase 2 (v0.3.0). It covers the data flow diagram, component responsibilities, thread model, and the command feedback path that closes the loop between AI decisions and telemetry state.
+This document describes the full architecture of the AI Race Engineer system as of Phase 3 (v0.3.4). It covers the data flow diagram, component responsibilities, thread model, and the command feedback path that closes the loop between AI decisions and telemetry state.
 
 ---
 
@@ -30,8 +30,11 @@ This document describes the full architecture of the AI Race Engineer system as 
 │  │  │  Telemetry Source                                          │ │   │
 │  │  │  src/telemetry/udp_listener.py                            │ │   │
 │  │  │                                                            │ │   │
-│  │  │  Parses PacketCarTelemetryData and PacketSessionData       │ │   │
-│  │  │  from binary UDP stream into raw Python dicts.            │ │   │
+│  │  │  Parses PacketLapData, PacketCarStatusData,               │ │   │
+│  │  │  PacketCarTelemetryData, PacketCarDamageData,             │ │   │
+│  │  │  PacketSessionData from binary F1 24 UDP stream.         │ │   │
+│  │  │  safetyCarStatus read at byte offset 124 after header:   │ │   │
+│  │  │    0 = green  1 = full SC  2 = VSC  3 = formation lap    │ │   │
 │  │  │  Exposes: start() / stop() / get_snapshot()               │ │   │
 │  │  └────────────────────────┬───────────────────────────────────┘ │   │
 │  │                           │  raw dict                           │   │
@@ -78,9 +81,13 @@ This document describes the full architecture of the AI Race Engineer system as 
 │  │  │                                                            │ │   │
 │  │  │  Deterministic rule engine. No AI here.                   │ │   │
 │  │  │  Evaluates: tyre life, fuel projection, stint age,        │ │   │
-│  │  │  gap deltas, safety car flag, end-of-race override.       │ │   │
-│  │  │  Returns: urgency (green/yellow/red), should_pit,         │ │   │
-│  │  │           reason string, safety_car bool.                 │ │   │
+│  │  │  gap deltas, track_status (green/safety_car/vsc),         │ │   │
+│  │  │  race phase (early/mid/endgame), cooldown windows.        │ │   │
+│  │  │  VSC pit logic: should_pit = True only if near stint      │ │   │
+│  │  │  window (tire_age >= expected_stint-2) OR tyre < 35%.     │ │   │
+│  │  │  Full SC: should_pit always True.                         │ │   │
+│  │  │  Returns: urgency, should_pit, reason, safety_car,        │ │   │
+│  │  │           race_phase, endgame_override.                   │ │   │
 │  │  └────────────────────────┬───────────────────────────────────┘ │   │
 │  │                           │  event dict                         │   │
 │  │                           ▼                                     │   │
@@ -91,11 +98,16 @@ This document describes the full architecture of the AI Race Engineer system as 
 │  │  │  Lap-by-lap stateful trigger evaluation.                  │ │   │
 │  │  │  Recalculates planned_pit_lap each lap from tyre data.    │ │   │
 │  │  │  Fires triggers when conditions are met:                  │ │   │
-│  │  │    INITIAL_BRIEF  │ PLAN_CHANGED  │ PIT_APPROACHING       │ │   │
-│  │  │    PIT_NOW        │ SC_OPPORTUNITY                        │ │   │
+│  │  │    INITIAL_BRIEF    │ PLAN_CHANGED   │ PIT_APPROACHING    │ │   │
+│  │  │    PIT_NOW          │ SC_OPPORTUNITY │ VSC_OPPORTUNITY    │ │   │
+│  │  │    ENDGAME_MANAGE   │ FINISH_RACE    │ FUEL_SAVE          │ │   │
+│  │  │    POSITION_GAINED  │ POSITION_LOST  │ DRS_ENABLED        │ │   │
+│  │  │  SC vs VSC: shared detection, branched decision.          │ │   │
+│  │  │    SC  → SC_OPPORTUNITY (auto-pit, one call per period)   │ │   │
+│  │  │    VSC → VSC_OPPORTUNITY (advisory only, never auto-pit)  │ │   │
 │  │  │  Guard flags prevent duplicate firing:                    │ │   │
 │  │  │    _pit_called, _approaching_called, _sc_pit_called,      │ │   │
-│  │  │    _last_spoken_lap                                       │ │   │
+│  │  │    _vsc_called, _last_spoken_lap                          │ │   │
 │  │  └────────────────────────┬───────────────────────────────────┘ │   │
 │  │                           │  trigger list  e.g. ["PIT_NOW"]     │   │
 │  │                           ▼                                     │   │
@@ -147,6 +159,7 @@ When the AI confirms a pit stop, a command flows back through the stack to modif
   Strategy Engine
        │
        │  trigger: "PIT_NOW" or "SC_OPPORTUNITY"
+       │  (VSC_OPPORTUNITY does NOT flow through this path — advisory only)
        ▼
   AI Engineer
        │
@@ -155,6 +168,12 @@ When the AI confirms a pit stop, a command flows back through the stack to modif
   src/main.py  (speak_proactive / urgency-change handler)
        │
        │  controller.trigger_pit(current_compound)
+       │
+       │  Guards before trigger_pit():
+       │    • not controller.is_pitting
+       │    • not event["endgame_override"]
+       │    • not sc_pit_already_used (one pit per SC period)
+       │    • not is_vsc (VSC advisory never auto-pits)
        ▼
   Telemetry Controller  ──►  PitStateMachine.trigger_pit()
                                       │
@@ -214,12 +233,13 @@ This feedback path is the reason the TelemetryController exists as a separate la
 
 | Layer | Module | Input | Output | Notes |
 |---|---|---|---|---|
-| Telemetry Source | `udp_listener.py` | Binary UDP | raw dict | Same interface as `simulator.py` |
+| Telemetry Source | `udp_listener.py` | Binary UDP | raw dict | Same interface as `simulator.py`; safetyCarStatus at byte 153 |
+| Packet Simulator | `udp_sender.py` | — | UDP packets | Full race sim; VSC laps 3–9, SC laps 33–43 |
 | Telemetry Controller | `telemetry_controller.py` | raw dict | raw dict + overrides | Proxy pattern; thread-safe |
 | Pit State Machine | `pit_state_machine.py` | trigger command | field overrides | FSM, 4 states |
 | Race State Builder | `state_manager.py` | raw dict | race_state | Typed, defaults applied |
-| Event Detector | `event_detector.py` | race_state | event dict | Deterministic rules only |
-| Strategy Engine | `strategy_tracker.py` | race_state + event | trigger list | Stateful, lap-by-lap |
+| Event Detector | `event_detector.py` | race_state | event dict | Deterministic rules; VSC/SC conditional pit; cooldowns |
+| Strategy Engine | `strategy_tracker.py` | race_state + event | trigger list | 12 triggers; SC/VSC branched; stateful, lap-by-lap |
 | AI Engineer | `response_generator.py` | prompt + history | response string | GPT-4o-mini |
 | Voice Output | `tts_engine.py` | response string | audio | macOS `say` subprocess |
 | Voice Input | `voice_input.py` | microphone | text string | Google Speech Recognition |
@@ -240,3 +260,9 @@ The TelemetryController means no other layer ever needs to know about pit stops,
 
 **`return []`, not `pass`.**
 During a safety car period, the strategy tracker uses `return []` after the SC block — not `pass`. This is the mechanism that prevents normal triggers (`PIT_NOW`, `PLAN_CHANGED`) from evaluating on the same lap as an SC call. A `pass` would fall through.
+
+**Shared detection, branched decision (VSC vs SC).**
+VSC and full SC share the same detection path — `track_status in ("safety_car", "virtual_safety_car")` — but branch at the strategy decision point. Full SC always recommends a pit stop. VSC only recommends a pit if the tyres are near the end of their natural stint window or critically worn. This keeps guard logic (endgame check, laps remaining, minimum tyre age) in one place while producing different strategic outputs.
+
+**Cooldowns gate the speak decision, not the urgency calculation.**
+Gap alert cooldowns are applied at the point where the engineer decides to speak, not inside `get_event()`. If the cooldown were inside `get_event()`, returning `urgency=green` during a suppressed lap would reset `last_urgency` to green — causing a new green→yellow transition every time the cooldown expired, which made alerts more frequent. By suppressing only the speak call while `last_urgency` continues tracking true urgency, no artificial transitions are created.
