@@ -101,7 +101,8 @@ This document describes the full architecture of the AI Race Engineer system as 
 │  │  │    INITIAL_BRIEF    │ PLAN_CHANGED   │ PIT_APPROACHING    │ │   │
 │  │  │    PIT_NOW          │ SC_OPPORTUNITY │ VSC_OPPORTUNITY    │ │   │
 │  │  │    ENDGAME_MANAGE   │ FINISH_RACE    │ FUEL_SAVE          │ │   │
-│  │  │    POSITION_GAINED  │ POSITION_LOST  │ DRS_ENABLED        │ │   │
+│  │  │    PUSH_MODE        │ POSITION_GAINED│ POSITION_LOST      │ │   │
+│  │  │    DRS_ENABLED                                             │ │   │
 │  │  │  SC vs VSC: shared detection, branched decision.          │ │   │
 │  │  │    SC  → SC_OPPORTUNITY (auto-pit, one call per period)   │ │   │
 │  │  │    VSC → VSC_OPPORTUNITY (advisory only, never auto-pit)  │ │   │
@@ -239,7 +240,7 @@ This feedback path is the reason the TelemetryController exists as a separate la
 | Pit State Machine | `pit_state_machine.py` | trigger command | field overrides | FSM, 4 states |
 | Race State Builder | `state_manager.py` | raw dict | race_state | Typed, defaults applied |
 | Event Detector | `event_detector.py` | race_state | event dict | Deterministic rules; VSC/SC conditional pit; cooldowns |
-| Strategy Engine | `strategy_tracker.py` | race_state + event | trigger list | 12 triggers; SC/VSC branched; stateful, lap-by-lap |
+| Strategy Engine | `strategy_tracker.py` | race_state + event | trigger list | 13 triggers; SC/VSC branched; push mode gap buffer; stateful, lap-by-lap |
 | AI Engineer | `response_generator.py` | prompt + history | response string | GPT-4o-mini |
 | Voice Output | `tts_engine.py` | response string | audio | macOS `say` subprocess |
 | Voice Input | `voice_input.py` | microphone | text string | Google Speech Recognition |

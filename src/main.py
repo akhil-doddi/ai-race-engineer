@@ -112,6 +112,7 @@ def speak_proactive(
         "ENDGAME_MANAGE":       "🏁 ENDGAME — TYRE MANAGEMENT",
         "FINISH_RACE":          "🏁 FINISH — NO MORE STOPS",
         "FUEL_SAVE":            "⛽ FUEL MANAGEMENT",
+        "PUSH_MODE":            "🏎️  PUSH — CLOSING ON CAR AHEAD",
         "POSITION_GAINED":      "📈 POSITION GAINED",
         "POSITION_LOST":        "📉 POSITION LOST",
         "DRS_ENABLED":          "💨 DRS AVAILABLE",

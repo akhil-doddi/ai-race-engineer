@@ -158,3 +158,19 @@ Understanding the reasoning helps future contributors maintain the system's inte
 **VSC_OPPORTUNITY never auto-pits:** Full SC triggers `controller.trigger_pit()` automatically via `speak_proactive()`. VSC does not. VSC delivers a verbal advisory; the driver decides. This prevents the system from automatically pitting on a VSC where staying out is the correct call.
 
 **Why ADR-011 is now superseded:** ADR-011 used the weather byte to detect SC status. This was a PS5-incompatible hack — the real PS5 game repurposes the weather byte for weather, not SC state. Phase 3 #5 fixed this by reading `safetyCarStatus` from its correct position in `PacketSessionData` (offset 124 bytes after the packet header, absolute byte 153 from packet start). Values: 0=green, 1=full SC, 2=VSC, 3=formation lap.
+
+---
+
+## ADR-016: Push Mode — 3-Lap Rolling Gap Buffer in StrategyTracker
+
+**Decision:** Push mode detection lives in `strategy_tracker.py` as a rolling 3-lap buffer of `gap_ahead` values, not in `event_detector.py`. The trigger fires when all 3 readings are monotonically decreasing and the total closure is >= 0.3 seconds.
+
+**Why strategy_tracker and not event_detector:** The event detector is stateless within a single call — it evaluates one snapshot and returns a verdict. Push mode requires cross-lap state (a buffer that accumulates over multiple calls). StrategyTracker already holds cross-lap state for the pit plan, position tracking, and DRS detection. Adding the gap buffer here follows the established pattern.
+
+**Why 3 laps, not 2 or 5:** 2 laps is too short — a single DRS pass or traffic effect can produce two shrinking readings that don't represent genuine pace advantage. 5 laps is too slow — by the time the engineer calls push mode after 5 laps of closing, the driver may have already passed or the gap may have stabilised. 3 laps is the Goldilocks threshold: filters single-lap noise while remaining responsive.
+
+**Why 0.3s minimum closure:** Without a floor, micro-oscillations (1.52 → 1.51 → 1.50) satisfy the "all decreasing" check but don't represent meaningful pace advantage. 0.3s over 3 laps (~0.1s/lap closing rate) is the minimum that represents actionable information — the driver would reach DRS range within a few more laps at that rate.
+
+**SC buffer flush:** Safety car compresses gaps artificially. When track goes green, gaps jump unpredictably as cars warm tyres and find their pace. Any gap readings from SC laps would corrupt the closing-rate calculation. The `_gap_buffer_sc_tainted` flag marks the buffer as dirty under SC; when green resumes, the entire buffer is cleared so the first 3 green-flag laps build a clean picture.
+
+**Alternative considered:** Storing the gap delta (change per lap) instead of raw gap values. Rejected because raw values are simpler to reason about and allow the build_prompt to show "gap 3 laps ago was X, now it's Y" — which is more useful to the driver than an abstract delta number.

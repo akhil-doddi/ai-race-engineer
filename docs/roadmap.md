@@ -61,7 +61,7 @@
   - `udp_sender.py` test windows: VSC laps 3–9, full SC laps 33–43, randomised each run
 
 **Remaining:**
-- 🔜 **#6 — Push mode** — rolling 3-lap gap delta buffer; if gap to car ahead is closing consistently, engineer calls a push lap
+- ✅ **#6 — Push mode** (v0.3.5) — rolling 3-lap gap_ahead buffer in strategy_tracker; fires `PUSH_MODE` when gap closes consistently (all 3 readings decreasing, total >= 0.3s). SC buffer flush prevents false alerts on restarts. Once per stint.
 - 🔜 **#7 — Fastest lap opportunity** — detect when driver can set fastest lap (fresh tyres, within range of current FL, last stint)
 
 ---

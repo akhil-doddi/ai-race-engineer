@@ -5,6 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.5] — 2026-04-08 — Phase 3 #6: Push Mode — Gap Closing Rate Detection
+
+### Added
+- `src/strategy/strategy_tracker.py`: `PUSH_MODE` trigger — fires once per stint when `gap_ahead`
+  has been shrinking consistently over the last 3 laps. Requires all 3 readings to be decreasing
+  AND total closure >= 0.3s (filters micro-oscillations).
+- `src/strategy/strategy_tracker.py`: Rolling `_gap_buffer` (last 3 gap_ahead values), with
+  `_gap_buffer_sc_tainted` flag. Buffer is flushed on SC→green transition to prevent false push
+  calls from artificial gap compression during safety car periods.
+- `src/strategy/strategy_tracker.py`: `_push_mode_called` flag — fires once per stint.
+  Resets in `reset_pit()` so a fresh stint on new tyres gets its own push opportunity.
+- `src/strategy/strategy_tracker.py`: `PUSH_MODE` build_prompt — includes gap 3 laps ago,
+  current gap, and per-lap closing rate. Energetic, motivating radio style.
+- `src/main.py`: `"PUSH_MODE": "🏎️  PUSH — CLOSING ON CAR AHEAD"` label in `speak_proactive()`.
+
+### Changed
+- `src/strategy/strategy_tracker.py`: Trigger docstring updated to list all 13 triggers
+  including `PUSH_MODE` and `VSC_OPPORTUNITY`.
+
+---
+
 ## [0.3.4] — 2026-04-07 — Phase 3 #5: VSC/SC Behavior Differentiation
 
 ### Added

@@ -21,16 +21,18 @@ THE STATE MACHINE:
 
 TRIGGER TYPES (in priority order):
     INITIAL_BRIEF     — Lap 2: "You are P8 on Medium, planning to box lap 25."
-    SC_OPPORTUNITY    — Safety car deployed, free pit window: "Safety car, box box box."
+    SC_OPPORTUNITY    — Full safety car, free pit window: "Safety car, box box box."
+    VSC_OPPORTUNITY   — Virtual SC, advisory only: "VSC out, stay out / consider boxing."
     ENDGAME_MANAGE    — Final 10 laps, pit suppressed: "Manage tyres and finish the race."
     FINISH_RACE       — Planned pit window arrives in endgame: "No stop, bring it home."
     PLAN_CHANGED      — Tyre data shifted pit window by 3+ laps: "New box window lap 28."
     PIT_APPROACHING   — 3 laps before box: "Pit stop in 3 laps, prepare."
     PIT_NOW           — At or past planned pit lap + should_pit: "Box box box."
+    FUEL_SAVE         — Projected fuel short of race end: "Lift and coast."
+    PUSH_MODE         — Gap closing for 3 laps straight: "Push now, you have pace."
     POSITION_GAINED   — Driver overtook: "Up to P7, gap ahead 0.8s."
     POSITION_LOST     — Driver was overtaken: "Dropped to P9, defend."
     DRS_ENABLED       — DRS first available this stint: "DRS active, use it."
-    FUEL_SAVE         — Projected fuel short of race end: "Lift and coast."
 
 ANTI-SPAM PROTECTION:
     - Each trigger fires ONCE per lap (last_spoken_lap guard)
@@ -128,6 +130,26 @@ class StrategyTracker:
         # race distance. NOT reset in reset_pit() because F1 cars do not
         # refuel during pit stops; once fuel is tight it stays tight.
         self._fuel_save_called: bool = False
+
+        # Push mode — rolling 3-lap gap_ahead buffer for closing-rate detection.
+        #
+        # HOW IT WORKS:
+        # Each lap, gap_ahead is appended to _gap_buffer. When the buffer has
+        # 3+ entries, we check if the gap has been shrinking consistently
+        # (each entry smaller than the previous). If so, the driver is closing
+        # on the car ahead and the engineer calls a push lap.
+        #
+        # SC GUARD: _gap_buffer_sc_tainted is set True when any lap in the
+        # buffer was recorded under safety car. When track goes green we flush
+        # the buffer entirely — SC restarts cause artificial gap jumps that
+        # would produce false push calls.
+        #
+        # FIRES ONCE PER STINT: _push_mode_called prevents repeating every lap
+        # while the gap keeps shrinking. Resets in reset_pit() so a fresh stint
+        # on new rubber can fire its own push call.
+        self._gap_buffer: list[float] = []
+        self._gap_buffer_sc_tainted: bool = False
+        self._push_mode_called: bool = False
 
     def evaluate(self, race_state: dict, event: dict) -> list[str]:
         """
@@ -409,6 +431,64 @@ class StrategyTracker:
             self._last_spoken_lap  = current_lap
             triggers.append("FUEL_SAVE")
 
+        # ── TRIGGER 5b: Push mode — closing rate detection ─────────────────
+        # Fires once per stint when the gap to the car ahead has been
+        # shrinking consistently over the last 3 laps.
+        #
+        # WHY 3 LAPS:
+        # A single lap of gap reduction could be traffic, DRS, or noise.
+        # 3 consecutive laps of closing means the driver genuinely has pace
+        # advantage. It's the minimum window that filters noise while still
+        # being responsive enough to call a push at the right time.
+        #
+        # SC BUFFER FLUSH:
+        # Any gap readings taken under SC/VSC are invalid — the field is
+        # artificially compressed. When SC ends (_gap_buffer_sc_tainted)
+        # we clear the entire buffer so the first 3 green-flag laps build
+        # a fresh closing-rate picture.
+        #
+        # WHY ONCE PER STINT:
+        # Once the engineer calls "push now", repeating it every lap while
+        # the gap keeps closing adds no information. The driver knows.
+        # _push_mode_called resets in reset_pit() so a fresh stint on new
+        # rubber gets its own push opportunity.
+        gap_ahead_now = race_state.get("gap_ahead", 0.0)
+
+        # SC taint: mark buffer as dirty if current lap is under SC/VSC.
+        if sc_active:
+            self._gap_buffer_sc_tainted = True
+
+        # Flush on SC→green transition: discard all SC-era readings.
+        if not sc_active and self._gap_buffer_sc_tainted:
+            self._gap_buffer.clear()
+            self._gap_buffer_sc_tainted = False
+
+        # Record gap if under green flag and gap is valid (> 0 means a car exists ahead).
+        if not sc_active and gap_ahead_now > 0.0 and current_lap >= 3:
+            self._gap_buffer.append(gap_ahead_now)
+            # Keep only the last 3 entries — we only need a 3-lap window.
+            if len(self._gap_buffer) > 3:
+                self._gap_buffer = self._gap_buffer[-3:]
+
+        # Check for consistent closing: each entry < the previous.
+        if (not triggers
+                and not self._push_mode_called
+                and len(self._gap_buffer) >= 3
+                and not sc_active
+                and current_lap >= 5
+                and current_lap != self._last_spoken_lap
+                and gap_ahead_now <= 3.0):   # only call push when within realistic striking distance
+            g = self._gap_buffer
+            closing = g[-1] < g[-2] < g[-3]
+            # Minimum total closure: at least 0.3s over the 3-lap window.
+            # This filters micro-oscillations (e.g. 1.52 → 1.51 → 1.50) that
+            # technically close but don't represent real pace advantage.
+            total_closure = g[-3] - g[-1]
+            if closing and total_closure >= 0.3:
+                self._push_mode_called = True
+                self._last_spoken_lap  = current_lap
+                triggers.append("PUSH_MODE")
+
         # ── TRIGGER 6: Position gained or lost ──────────────────────────────
         # Fires when race position changes vs. the previous lap baseline.
         #
@@ -524,6 +604,13 @@ class StrategyTracker:
         # the car first enters a DRS zone on the out-lap.
         self._drs_enabled_announced = False
         self._last_drs = False
+        # Push mode: fresh stint starts with an empty gap buffer so the
+        # out-lap gap (artificially large after pit exit) doesn't poison
+        # the closing-rate calculation. _push_mode_called resets so the
+        # new stint can fire its own push call when closing resumes.
+        self._gap_buffer.clear()
+        self._gap_buffer_sc_tainted = False
+        self._push_mode_called = False
         # NOTE: _sc_pit_called is NOT reset here.
         # It resets only when track goes green (end of SC period), handled in evaluate().
         # If reset_pit() cleared it, a second SC_OPPORTUNITY would fire for the same
@@ -661,6 +748,25 @@ class StrategyTracker:
                 f"Instruct the driver to start lifting and coasting to save fuel. "
                 f"Tell them the shortfall and what to do. "
                 f"2 sentences max. Calm, clear radio style."
+            )
+
+        elif trigger == "PUSH_MODE":
+            # Calculate closing rate from the buffer for the prompt.
+            buf = self._gap_buffer
+            if len(buf) >= 3:
+                closing_rate = round((buf[-3] - buf[-1]) / 2, 2)  # avg per lap
+                gap_3_ago    = round(buf[-3], 1)
+            else:
+                closing_rate = 0.0
+                gap_3_ago    = gap_ahe
+            return (
+                f"[ENGINEER BRIEFING] Gap to car ahead is closing consistently. "
+                f"3 laps ago the gap was {gap_3_ago}s, now it's {gap_ahe:.1f}s — "
+                f"closing at approximately {closing_rate}s per lap. "
+                f"We are P{pos} on {compound} at {life:.0f}% life. "
+                f"Tell the driver they have pace advantage, push now, and aim to "
+                f"get within DRS range. Mention the gap and closing rate. "
+                f"1-2 sentences. Energetic, motivating radio style."
             )
 
         elif trigger == "DRS_ENABLED":
