@@ -67,4 +67,15 @@ def build_race_state(raw: dict) -> dict:
         # This comes from the simulator (track_status field) or from the UDP
         # listener in Phase 2. Defaults to "green" if not present.
         "track_status": str(raw.get("track_status", "green")),
+
+        # FastF1 replay extras — None / False when using simulator or UDP.
+        # pit_this_lap      : True when FastF1 data shows a pit stop occurred
+        #                     this lap (TyreLife reset). main.py uses this to
+        #                     call tracker.reset_pit() without running the pit
+        #                     simulation animation.
+        # session_fastest_lap : Best lap time (seconds) from ALL 20 drivers up
+        #                       to the current lap. Used by the upcoming Phase 3
+        #                       #7 fastest-lap trigger. None until lap 1 data loads.
+        "pit_this_lap":           bool(raw.get("pit_this_lap", False)),
+        "session_fastest_lap":    raw.get("session_fastest_lap", None),
     }

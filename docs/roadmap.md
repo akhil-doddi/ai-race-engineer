@@ -62,7 +62,8 @@
 
 **Remaining:**
 - ✅ **#6 — Push mode** (v0.3.5) — rolling 3-lap gap_ahead buffer in strategy_tracker; fires `PUSH_MODE` when gap closes consistently (all 3 readings decreasing, total >= 0.3s). SC buffer flush prevents false alerts on restarts. Once per stint.
-- 🔜 **#7 — Fastest lap opportunity** — detect when driver can set fastest lap (fresh tyres, within range of current FL, last stint)
+- ✅ **FastF1 historical replay** (v0.3.6) — `src/telemetry/fastf1_replay.py`; any completed race from ~2018, any driver on the grid. Same `get_snapshot()` interface as UDP. Provides `session_fastest_lap` (rolling best from all 20 drivers) and `pit_this_lap` (TyreLife-drop pit detection) — data foundation for #7.
+- 🔜 **#7 — Fastest lap opportunity** — detect when driver can set fastest lap (fresh tyres, within range of current FL, last stint). `session_fastest_lap` already flowing through state_manager from FastF1 replay.
 
 ---
 

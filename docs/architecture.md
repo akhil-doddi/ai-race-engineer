@@ -1,6 +1,6 @@
 # System Architecture
 
-This document describes the full architecture of the AI Race Engineer system as of Phase 3 (v0.3.4). It covers the data flow diagram, component responsibilities, thread model, and the command feedback path that closes the loop between AI decisions and telemetry state.
+This document describes the full architecture of the AI Race Engineer system as of Phase 3 (v0.3.6). It covers the data flow diagram, component responsibilities, thread model, and the command feedback path that closes the loop between AI decisions and telemetry state.
 
 ---
 
@@ -8,16 +8,22 @@ This document describes the full architecture of the AI Race Engineer system as 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  PROCESS 1 — Telemetry Source                                           │
+│  PROCESS 1 — Telemetry Source  (choose one at startup)                  │
 │                                                                         │
-│   PS5 running Codemasters F1 24          OR    udp_sender.py            │
-│   (live game telemetry)                        (simulated race, no PS5) │
+│   A) PS5 running Codemasters F1 24          B) udp_sender.py            │
+│      (live game, real-time UDP)                (simulated race, no PS5) │
+│      Broadcasts binary UDP packets @ port 20777 on local network        │
 │                                                                         │
-│   Broadcasts binary UDP packets @ port 20777 on local network           │
+│   C) FastF1Replay                                                       │
+│      (historical race data — any completed race from ~2018 onwards)     │
+│      Downloads session via FastF1 Python package, replays lap-by-lap    │
+│      in a background thread at configurable speed. No UDP involved.     │
 └───────────────────────────────────┬─────────────────────────────────────┘
                                     │
-                                    │  UDP  (60 Hz broadcast)
-                                    │  binary Codemasters F1 24 format
+                                    │  A/B: UDP (60 Hz broadcast)
+                                    │       binary Codemasters F1 24 format
+                                    │  C:   get_snapshot() dict in memory
+                                    │       same interface as A/B
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -27,15 +33,24 @@ This document describes the full architecture of the AI Race Engineer system as 
 │  │  THREAD 1 — ProactiveMonitor  (1-second poll loop)              │   │
 │  │                                                                  │   │
 │  │  ┌────────────────────────────────────────────────────────────┐ │   │
-│  │  │  Telemetry Source                                          │ │   │
-│  │  │  src/telemetry/udp_listener.py                            │ │   │
+│  │  │  Telemetry Source (one of three)                           │ │   │
 │  │  │                                                            │ │   │
-│  │  │  Parses PacketLapData, PacketCarStatusData,               │ │   │
-│  │  │  PacketCarTelemetryData, PacketCarDamageData,             │ │   │
-│  │  │  PacketSessionData from binary F1 24 UDP stream.         │ │   │
-│  │  │  safetyCarStatus read at byte offset 124 after header:   │ │   │
-│  │  │    0 = green  1 = full SC  2 = VSC  3 = formation lap    │ │   │
-│  │  │  Exposes: start() / stop() / get_snapshot()               │ │   │
+│  │  │  src/telemetry/udp_listener.py  (live PS5 / udp_sender)  │ │   │
+│  │  │    Parses PacketLapData, PacketCarStatusData,             │ │   │
+│  │  │    PacketCarTelemetryData, PacketCarDamageData,           │ │   │
+│  │  │    PacketSessionData from binary F1 24 UDP stream.       │ │   │
+│  │  │    safetyCarStatus at byte offset 124 after header:      │ │   │
+│  │  │      0=green  1=full SC  2=VSC  3=formation lap          │ │   │
+│  │  │                                                            │ │   │
+│  │  │  src/telemetry/fastf1_replay.py  (historical replay)     │ │   │
+│  │  │    Loads any completed race via FastF1 Python package.   │ │   │
+│  │  │    Any driver on the 20-car grid, any race from ~2018.   │ │   │
+│  │  │    Computes gaps from cumulative Time column (~0.5s acc) │ │   │
+│  │  │    Runs session_fastest_lap (all 20 drivers, rolling).   │ │   │
+│  │  │    pit_this_lap flag: TyreLife drop = pit stop detected. │ │   │
+│  │  │    Replays at configurable speed in background thread.   │ │   │
+│  │  │                                                            │ │   │
+│  │  │  All sources expose: start() / stop() / get_snapshot()   │ │   │
 │  │  └────────────────────────┬───────────────────────────────────┘ │   │
 │  │                           │  raw dict                           │   │
 │  │                           ▼                                     │   │
@@ -234,11 +249,12 @@ This feedback path is the reason the TelemetryController exists as a separate la
 
 | Layer | Module | Input | Output | Notes |
 |---|---|---|---|---|
-| Telemetry Source | `udp_listener.py` | Binary UDP | raw dict | Same interface as `simulator.py`; safetyCarStatus at byte 153 |
-| Packet Simulator | `udp_sender.py` | — | UDP packets | Full race sim; VSC laps 3–9, SC laps 33–43 |
+| Telemetry Source — Live | `udp_listener.py` | Binary UDP | raw dict | safetyCarStatus at byte 153; same interface as all sources |
+| Telemetry Source — Sim | `udp_sender.py` | — | UDP packets | Full race sim; VSC laps 3–9, SC laps 33–43 |
+| Telemetry Source — Replay | `fastf1_replay.py` | FastF1 session | raw dict | Any race from ~2018; lap-by-lap replay; `pit_this_lap`, `session_fastest_lap` fields |
 | Telemetry Controller | `telemetry_controller.py` | raw dict | raw dict + overrides | Proxy pattern; thread-safe |
-| Pit State Machine | `pit_state_machine.py` | trigger command | field overrides | FSM, 4 states |
-| Race State Builder | `state_manager.py` | raw dict | race_state | Typed, defaults applied |
+| Pit State Machine | `pit_state_machine.py` | trigger command | field overrides | FSM, 4 states; not used during FastF1 replay |
+| Race State Builder | `state_manager.py` | raw dict | race_state | Typed, defaults applied; `pit_this_lap` and `session_fastest_lap` pass-through |
 | Event Detector | `event_detector.py` | race_state | event dict | Deterministic rules; VSC/SC conditional pit; cooldowns |
 | Strategy Engine | `strategy_tracker.py` | race_state + event | trigger list | 13 triggers; SC/VSC branched; push mode gap buffer; stateful, lap-by-lap |
 | AI Engineer | `response_generator.py` | prompt + history | response string | GPT-4o-mini |

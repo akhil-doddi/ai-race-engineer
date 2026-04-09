@@ -13,3 +13,9 @@ pyttsx3>=2.90
 
 # Environment variable loading — reads API keys from .env file
 python-dotenv>=1.0.0
+
+# FastF1 — historical F1 race data replay (Phase 3 FastF1 replay source)
+# Provides lap-by-lap telemetry, tyre data, gaps, and track status for any
+# completed race session from 2018 onwards.
+# Docs: https://docs.fastf1.dev
+fastf1>=3.3.0

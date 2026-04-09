@@ -25,6 +25,9 @@ env/
 # Future: Docker
 *.log
 
+# FastF1 session cache — can be large (100MB+ per season), regenerated on demand
+.fastf1_cache/
+
 # Future: build artifacts
 dist/
 build/

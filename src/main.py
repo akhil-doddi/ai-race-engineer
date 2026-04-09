@@ -38,6 +38,7 @@ import time
 
 from src.telemetry.simulator            import TelemetrySimulator
 from src.telemetry.udp_listener         import UDPTelemetryListener
+from src.telemetry.fastf1_replay        import FastF1Replay, list_drivers
 from src.telemetry.telemetry_controller import TelemetryController
 from src.race_state.state_manager       import build_race_state
 from src.events.event_detector          import (
@@ -207,6 +208,16 @@ def proactive_monitor(
             stop_event.wait(timeout=1.0)
             continue
 
+        # ── FastF1 replay pit detection ─────────────────────────────────────
+        # FastF1 data shows a pit stop happened (TyreLife reset). We reset
+        # the strategy tracker without triggering the pit animation — the
+        # real pit already happened in the historical data. We also suppress
+        # the auto-pit trigger for this lap so it doesn't double-fire.
+        if race_state.get("pit_this_lap", False) and not controller.is_pitting:
+            tracker.reset_pit()
+            auto_pit_state["triggered"] = True   # suppress 50% auto-pit this lap
+            print(f"📼 FastF1 pit detected — tracker reset, monitoring new stint\n")
+
         # ── Auto-pit: tyre life < 50% ────────────────────────────────────────
         # Fires once per stint. auto_pit_state["triggered"] is reset by
         # on_pit_complete() when the pit simulation finishes, so this fires
@@ -356,18 +367,89 @@ def proactive_monitor(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _setup_fastf1_replay() -> "FastF1Replay | None":
+    """
+    Interactive setup flow for FastF1 replay mode.
+
+    Asks for year, race event, driver, and replay speed.
+    Returns a loaded FastF1Replay instance ready to be wrapped in
+    TelemetryController, or None if the user aborts or an error occurs.
+    """
+    print("\n📼 FastF1 Replay Mode")
+    print("─" * 42)
+    print("Replays any completed F1 race for any driver on the grid.")
+    print("Data is cached locally after the first download.\n")
+
+    try:
+        year = int(input("Year (e.g. 2023): ").strip())
+    except ValueError:
+        print("Invalid year.")
+        return None
+
+    event = input("Race (e.g. 'Monza', 'Italian Grand Prix', or round number): ").strip()
+    if not event:
+        print("No event entered.")
+        return None
+
+    # Show all 20 drivers for this session
+    try:
+        drivers = list_drivers(year, event)
+    except Exception as exc:
+        print(f"❌ Could not load driver list: {exc}")
+        return None
+
+    print(f"\n{'No.':<4} {'Abbr':<6} {'Driver':<28} {'Team'}")
+    print("─" * 60)
+    for i, d in enumerate(drivers, 1):
+        print(f"{i:<4} {d['abbr']:<6} {d['full_name']:<28} {d['team']}")
+
+    abbr_input = input("\nEnter driver abbreviation (e.g. VER): ").strip().upper()
+    if abbr_input not in [d["abbr"] for d in drivers]:
+        print(f"'{abbr_input}' not found in driver list.")
+        return None
+
+    speed_input = input(
+        "Replay speed — laps per second: '3' (default), '1' (slow), '0.5' (fast): "
+    ).strip()
+    try:
+        lap_interval = float(speed_input) if speed_input else 3.0
+    except ValueError:
+        lap_interval = 3.0
+
+    replay = FastF1Replay()
+    try:
+        replay.load_session(
+            year=year,
+            event=event,
+            driver_abbr=abbr_input,
+            lap_interval=lap_interval,
+        )
+    except Exception as exc:
+        print(f"❌ Failed to load session: {exc}")
+        return None
+
+    return replay
+
+
 def main():
     print("🏎️  AI Race Engineer — starting up...")
     print("─" * 42)
 
     # --- Telemetry source ---
     raw_telem = input(
-        "Telemetry source — 's' for simulator, 'u' for UDP (PS5/sender): "
+        "Telemetry source — 's' simulator, 'u' UDP (PS5/sender), 'f' FastF1 replay: "
     ).strip().lower()
 
     if raw_telem == "u":
         raw_source = UDPTelemetryListener()
         print("📡 UDP mode — start udp_sender.py in a second terminal if no PS5.")
+
+    elif raw_telem == "f":
+        raw_source = _setup_fastf1_replay()
+        if raw_source is None:
+            print("FastF1 setup failed — falling back to simulator.")
+            raw_source = TelemetrySimulator()
+
     else:
         raw_source = TelemetrySimulator()
         print("📡 Simulator mode — no external hardware required.")

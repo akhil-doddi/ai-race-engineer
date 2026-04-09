@@ -174,3 +174,23 @@ Understanding the reasoning helps future contributors maintain the system's inte
 **SC buffer flush:** Safety car compresses gaps artificially. When track goes green, gaps jump unpredictably as cars warm tyres and find their pace. Any gap readings from SC laps would corrupt the closing-rate calculation. The `_gap_buffer_sc_tainted` flag marks the buffer as dirty under SC; when green resumes, the entire buffer is cleared so the first 3 green-flag laps build a clean picture.
 
 **Alternative considered:** Storing the gap delta (change per lap) instead of raw gap values. Rejected because raw values are simpler to reason about and allow the build_prompt to show "gap 3 laps ago was X, now it's Y" — which is more useful to the driver than an abstract delta number.
+
+---
+
+## ADR-017: FastF1 as a Third Telemetry Source — Same Interface, Different Origin
+
+**Decision:** `FastF1Replay` in `src/telemetry/fastf1_replay.py` implements the same `start()` / `stop()` / `get_snapshot()` interface as `udp_listener.py` and `simulator.py`. It is treated by every layer above it as just another telemetry source. No upstream layer was modified to accommodate it.
+
+**Why the same interface matters:** The Race State Builder (`state_manager.py`) receives a raw dict and does not know — or care — which source produced it. The TelemetryController wraps any source with the same proxy logic. This is the payoff of ADR-003: adding a third data source is a single new file + a menu option in `main.py`. Zero changes to event_detector, strategy_tracker, or the AI layer.
+
+**Why FastF1 and not a CSV export or manual data:** FastF1 wraps the official Ergast / OpenF1 / Jolyon Palmer datasets and provides a typed DataFrame API per session. It handles authentication, caching (`.fastf1_cache/`), and session structure automatically. A manual CSV approach would require maintaining data files and custom parsers. FastF1 gives us every race from 2018 with one `pip install`.
+
+**Why lap-by-lap not telemetry-by-telemetry:** FastF1's per-lap granularity (one row per driver per lap) matches what the strategy engine consumes. The strategy tracker evaluates once per lap; sub-lap telemetry from the 60Hz UDP stream is redundant for lap-level decisions. Lap-level replay is simpler, more deterministic for testing, and directly maps to the trigger cadence.
+
+**Gap computation approach:** FastF1 provides a cumulative `Time` column (elapsed seconds from race start to lap end for each driver). The gap between two adjacent-position cars is their `Time` delta on the same lap number. This is accurate to ~0.5s — sufficient for "should we push?" or "are we under threat?" decisions. The alternative (using official gap data from gap_to_leader columns) was considered but those columns are less reliably populated in FastF1 across all seasons.
+
+**`pit_this_lap` flag design:** Real historical pit stops don't need the `PitStateMachine` animation — the car already pitted; we just need the strategy tracker to reset for the new stint. The `pit_this_lap` flag (set `True` for exactly one lap when TyreLife drops) gives `main.py` a clean hook: `tracker.reset_pit()` + suppress auto-pit. The FSM stays dormant. This keeps the interactive and replay paths separate without branching logic in the monitor loop.
+
+**`session_fastest_lap` as Phase 3 #7 foundation:** The trigger for "driver can challenge for fastest lap" requires knowing the current session fastest from all 20 cars. That number changes every lap as teams push. FastF1 provides per-driver lap times for the full grid, so `_compute_running_fastest_lap()` is a natural O(n) pass over the dataset. It flows through `state_manager.py` as a pass-through field (defaults `None` for simulator and UDP sources, which don't have full-grid data). Phase 3 #7 reads it directly from `race_state["session_fastest_lap"]` without any new data plumbing.
+
+**Alternative considered:** Building a separate `FastF1DataBroker` class that all layers query directly rather than funnelling through `get_snapshot()`. Rejected because it would break the single-source-of-truth contract — two paths to the same data creates synchronisation bugs. The telemetry interface is the right abstraction boundary.

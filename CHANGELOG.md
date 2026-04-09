@@ -5,6 +5,47 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [0.3.6] — 2026-04-09 — FastF1 Historical Race Replay Telemetry Source
+
+### Added
+- `src/telemetry/fastf1_replay.py` — new telemetry source that replays any completed F1 race
+  from the FastF1 historical dataset (~2018 onwards). Provides the same `start()` / `stop()` /
+  `get_snapshot()` interface as `udp_listener.py` and `simulator.py` — zero changes required
+  in any layer above it.
+- `FastF1Replay.load_session(year, event, driver_abbr, lap_interval)` — downloads and caches
+  a race session via FastF1, builds a lap-by-lap snapshot list for the chosen driver. Caches
+  locally at `.fastf1_cache/` to avoid repeated downloads.
+- `list_drivers(year, event)` — returns all 20 grid drivers with name and team for selection
+  UI in `main.py`.
+- Gap computation from FastF1 cumulative `Time` column — delta between adjacent-position
+  drivers on the same lap, accurate to ~0.5s. Sufficient for strategy decisions.
+- `_compute_running_fastest_lap()` — rolling best lap time from all 20 drivers up to the
+  current lap. Stored as `session_fastest_lap` in each snapshot. Foundation for Phase 3 #7.
+- `_estimate_tire_wear()` — two-phase cliff model (linear decay + acceleration after 70% of
+  max stint) matching `event_detector.py`'s wear model for consistency.
+- `pit_this_lap` flag — detects when FastF1 `TyreLife` resets (pit stop occurred). Set
+  `True` for one lap only; tells `main.py` to reset the strategy tracker without running
+  the `PitStateMachine` animation (historical pits don't need the interactive animation).
+- `src/race_state/state_manager.py`: `pit_this_lap` and `session_fastest_lap` pass-through
+  fields — both default to `False` / `None` when using simulator or UDP, so no breaking
+  changes to existing telemetry paths.
+- `src/main.py`: `'f'` option in telemetry source prompt — triggers `_setup_fastf1_replay()`
+  interactive setup (year → event → driver list → driver abbreviation → replay speed).
+- `src/main.py`: FastF1 pit detection handler in `proactive_monitor` — calls
+  `tracker.reset_pit()` and sets `auto_pit_state["triggered"] = True` when `pit_this_lap`
+  is `True`, suppressing the 50% auto-pit and updating stint tracking for the new set.
+- `requirements.txt`: `fastf1>=3.3.0` dependency added.
+- `.gitignore`: `.fastf1_cache/` excluded — cache can reach 100MB+ per season, regenerated
+  on demand.
+
+### Notes
+- FastF1 must be installed manually on first use: `pip install fastf1`
+- Sessions are cached after the first download; subsequent loads are instant
+- `session_fastest_lap` flowing through state_manager is the data foundation for
+  Phase 3 #7 (fastest lap opportunity trigger) — that trigger is built next
+
+---
+
 ## [0.3.5] — 2026-04-08 — Phase 3 #6: Push Mode — Gap Closing Rate Detection
 
 ### Added
